@@ -1,0 +1,35 @@
+# Données volumineuses
+data/
+*.osm.pbf
+*.json.gz
+*.geojson
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Sorties
+output/
+*.html
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
