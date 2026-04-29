@@ -1,0 +1,36 @@
+[perimeter]
+# 20 départements couverts : Ouest de la France, de Fécamp (76) à Poitiers (86)
+departments = [
+    "76",  # Seine-Maritime
+    "27",  # Eure
+    "14",  # Calvados
+    "50",  # Manche
+    "61",  # Orne
+    "28",  # Eure-et-Loir
+    "72",  # Sarthe
+    "53",  # Mayenne
+    "35",  # Ille-et-Vilaine
+    "22",  # Côtes-d'Armor
+    "29",  # Finistère
+    "56",  # Morbihan
+    "44",  # Loire-Atlantique
+    "49",  # Maine-et-Loire
+    "85",  # Vendée
+    "79",  # Deux-Sèvres
+    "86",  # Vienne
+    "37",  # Indre-et-Loire
+    "41",  # Loir-et-Cher
+    "45",  # Loiret
+]
+
+[database]
+path = "data/processed/cadastre.duckdb"
+
+[cadastre]
+base_url = "https://cadastre.data.gouv.fr/data/etalab-cadastre"
+latest_version = "latest"
+
+[search]
+min_terrain_m2 = 2500
+default_tolerance_pct = 5.0
+default_top_n = 20
