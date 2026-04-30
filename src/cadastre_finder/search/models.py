@@ -17,6 +17,9 @@ class ParcelMatch:
     geometry_geojson: str
     score: float = 0.0
     rank: int = 0
+    built_area: Optional[float] = None
+    dpe_label: Optional[str] = None
+    ges_label: Optional[str] = None
 
     @property
     def street_view_url(self) -> str:
@@ -45,6 +48,8 @@ class ComboMatch:
     score: float = 0.0
     rank: int = 0
     compactness: float = 0.0   # Polsby-Popper [0, 1]
+    dpe_label: Optional[str] = None
+    ges_label: Optional[str] = None
 
     @property
     def nb_parcelles(self) -> int:

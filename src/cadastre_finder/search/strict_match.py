@@ -103,9 +103,9 @@ def search_strict(
                 score=score,
                 rank=0,
             ))
-
-        if built_only:
-            matches = filter_built_parcels(matches, con)
+        
+        # On calcule toujours built_area, mais on ne filtre que si built_only est True
+        matches = filter_built_parcels(matches, con, drop_unbuilt=built_only)
     finally:
         con.close()
 

@@ -45,5 +45,11 @@ CRS_WGS84 = "EPSG:4326"
 
 # Seuils métier
 MIN_TERRAIN_M2 = 2500
+MIN_ANCHOR_BUILT_M2 = 65
 DEFAULT_TOLERANCE_PCT = 5.0
 DEFAULT_TOP_N = 20
+
+# DPE settings
+DPE_TABLE = "dpe"
+# ADEME DPE Open Data URL (Logements existants - version 2.0)
+DPE_URL = "https://data.ademe.fr/datasets/dpe-v2-logements-existants/download"

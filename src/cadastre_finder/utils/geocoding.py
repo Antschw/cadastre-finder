@@ -155,6 +155,27 @@ def _search_api(
     return results
 
 
+def geocode_address(address: str, city: Optional[str] = None, postcode: Optional[str] = None) -> Optional[tuple[float, float]]:
+    """Géo-code une adresse complète via l'API Adresse. Retourne (lat, lon) ou None."""
+    params = {"q": address}
+    if city:
+        params["city"] = city
+    if postcode:
+        params["postcode"] = postcode
+    
+    try:
+        resp = httpx.get(f"{API_ADRESSE_URL}/search/", params=params, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("features"):
+            coords = data["features"][0]["geometry"]["coordinates"]
+            return coords[1], coords[0]  # Lat, Lon
+    except Exception as e:
+        logger.debug(f"[geocoding] Erreur géocodage adresse '{address}': {e}")
+    
+    return None
+
+
 def resolve_commune(
     name: str,
     postal_code: Optional[str] = None,

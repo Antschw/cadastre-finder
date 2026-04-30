@@ -15,9 +15,11 @@ from loguru import logger
 from shapely.geometry import shape
 from shapely.ops import unary_union
 
-from cadastre_finder.config import DB_PATH, DEFAULT_TOLERANCE_PCT, DEFAULT_TOP_N, MIN_TERRAIN_M2
+from cadastre_finder.config import (
+    DB_PATH, DEFAULT_TOLERANCE_PCT, DEFAULT_TOP_N, MIN_TERRAIN_M2, MIN_ANCHOR_BUILT_M2
+)
 from cadastre_finder.processing.adjacency import get_neighbors
-from cadastre_finder.search.building_filter import filter_built_combos
+from cadastre_finder.search.building_filter import filter_built_combos, filter_built_parcels
 from cadastre_finder.search.models import ComboMatch, ParcelMatch
 from cadastre_finder.utils.geocoding import resolve_commune
 
@@ -233,10 +235,15 @@ def _find_combos_dfs(
     tolerance_pct: float,
     max_parts: int,
     top_n: int,
+    start_indices: Optional[list[int]] = None,
+    min_compactness: float = 0.2,
 ) -> list[ComboMatch]:
     """DFS sur le graphe d'adjacence pour trouver les sous-ensembles connexes dans la plage."""
     if not candidates:
         return []
+
+    if start_indices is None:
+        start_indices = list(range(len(candidates)))
 
     idx_by_id = {p.id_parcelle: i for i, p in enumerate(candidates)}
     delta = target_m2 * tolerance_pct / 100.0
@@ -260,7 +267,10 @@ def _find_combos_dfs(
 
         if lo <= total <= hi and len(combo) >= 2:
             parts = [candidates[i] for i in combo]
-            results.append(_build_combo(parts, target_m2))
+            c = _build_combo(parts, target_m2)
+            # Filtrage par compacité : on ignore les formes trop allongées ou fragmentées
+            if c.compactness >= min_compactness:
+                results.append(c)
 
         if total >= hi or len(combo) >= max_parts:
             return
@@ -282,7 +292,8 @@ def _find_combos_dfs(
             )
             dfs(combo + [idx], new_total, new_reachable)
 
-    for i, p in enumerate(candidates):
+    for i in start_indices:
+        p = candidates[i]
         if nodes_visited[0] > MAX_DFS_NODES:
             logger.warning(
                 f"[combo_match] Plafond DFS atteint ({MAX_DFS_NODES:,} nœuds). "
@@ -330,6 +341,7 @@ def search_combos(
     max_parts: int = MAX_PARTS,
     top_n: int = DEFAULT_TOP_N,
     built_only: bool = True,
+    anchors_only: bool = False,
     db_path: Path = DB_PATH,
 ) -> list[ComboMatch]:
     """Recherche des combinaisons connexes de 2 à max_parts parcelles adjacentes.
@@ -392,7 +404,17 @@ def search_combos(
             f"[combo_match] {sum(len(v) for v in graph.values()) // 2} paires adjacentes"
         )
 
-        combos = _find_combos_dfs(candidates, graph, surface_m2, tolerance_pct, max_parts, top_n * 3)
+        start_indices = None
+        if anchors_only:
+            # On calcule built_area pour tous les candidats
+            candidates = filter_built_parcels(candidates, con, drop_unbuilt=False)
+            start_indices = [
+                i for i, c in enumerate(candidates) 
+                if (c.built_area and c.built_area >= MIN_ANCHOR_BUILT_M2) or c.built_area == -1.0
+            ]
+            logger.info(f"[combo_match] {len(start_indices)} parcelles ancres (>= {MIN_ANCHOR_BUILT_M2}m² bâti)")
+
+        combos = _find_combos_dfs(candidates, graph, surface_m2, tolerance_pct, max_parts, top_n * 3, start_indices=start_indices)
         combos = _deduplicate_combos(combos, surface_m2)
 
         if built_only:

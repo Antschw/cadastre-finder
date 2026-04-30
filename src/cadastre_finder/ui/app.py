@@ -5,6 +5,7 @@ Lancement : cadastre-finder ui
 """
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 from typing import Union
@@ -204,7 +205,21 @@ def _display_result(result: Union[ParcelMatch, ComboMatch], idx: int, total: int
         if isinstance(result, ComboMatch):
             st.markdown(f"**Combinaison** de {result.nb_parcelles} parcelles")
             st.metric("Surface totale", f"{result.total_contenance:,} m²")
+            
+            # Surface bâtie cumulée
+            barea = sum(p.built_area or 0 for p in result.parts)
+            if barea > 0:
+                st.metric("Emprise bâtie estimée", f"{barea:.1f} m²")
+
             st.metric("Commune", f"{result.nom_commune} ({result.code_insee})")
+
+            # DPE / GES
+            if result.dpe_label or result.ges_label:
+                c1, c2 = st.columns(2)
+                if result.dpe_label:
+                    c1.metric("DPE", result.dpe_label)
+                if result.ges_label:
+                    c2.metric("GES", result.ges_label)
 
             pp = result.compactness
             pp_color = "#2e7d32" if pp >= 0.5 else ("#e65100" if pp < 0.2 else "#f9a825")
@@ -230,7 +245,20 @@ def _display_result(result: Union[ParcelMatch, ComboMatch], idx: int, total: int
         else:
             st.markdown(f"**Parcelle** individuelle")
             st.metric("Surface", f"{result.contenance:,} m²")
+            
+            if result.built_area and result.built_area > 0:
+                st.metric("Emprise bâtie", f"{result.built_area:.1f} m²")
+
             st.metric("Commune", f"{result.nom_commune} ({result.code_insee})")
+            
+            # DPE / GES
+            if result.dpe_label or result.ges_label:
+                c1, c2 = st.columns(2)
+                if result.dpe_label:
+                    c1.metric("DPE", result.dpe_label)
+                if result.ges_label:
+                    c2.metric("GES", result.ges_label)
+
             st.metric("Identifiant", result.id_parcelle)
 
             st.write("")
@@ -241,7 +269,9 @@ def _display_result(result: Union[ParcelMatch, ComboMatch], idx: int, total: int
                 st.link_button("Street View", result.street_view_url)
 
     with col_map:
-        components.html(_make_mini_map(result), height=480, scrolling=False)
+        html = _make_mini_map(result)
+        b64_html = base64.b64encode(html.encode()).decode()
+        st.iframe(src=f"data:text/html;base64,{b64_html}", height=480)
 
 
 # ---------------------------------------------------------------------------
@@ -278,47 +308,29 @@ def _results_overview(
 def _run_search(
     commune: str,
     surface: float,
+    living_surface: float | None,
+    dpe: str | None,
+    ges: str | None,
     postal: str | None,
     tolerance_m2: float,
-    max_parts: int,
     rank2: bool,
-    no_combo: bool,
-    include_agri: bool,
     db_path_str: str,
-) -> tuple[list[ParcelMatch], list[ComboMatch]]:
-    from cadastre_finder.search.strict_match import search_strict
-    from cadastre_finder.search.neighbor_match import search_with_neighbors
-    from cadastre_finder.search.combo_match import search_combos
+) -> list[Union[ParcelMatch, ComboMatch]]:
+    from cadastre_finder.search.orchestrator import search_orchestrated
 
     db_path = Path(db_path_str)
-    built_only = not include_agri
     tolerance_pct = (tolerance_m2 / surface * 100.0) if surface > 0 else 0.0
 
-    matches = search_strict(commune, surface, postal_code=postal, built_only=built_only, db_path=db_path)
-
-    if not matches or len(matches) > 3:
-        matches = search_with_neighbors(
-            commune, surface,
-            postal_code=postal,
-            tolerance_pct=tolerance_pct,
-            include_rank2=rank2,
-            built_only=built_only,
-            db_path=db_path,
-        )
-
-    combos: list[ComboMatch] = []
-    if not no_combo:
-        combos = search_combos(
-            commune, surface,
-            postal_code=postal,
-            tolerance_pct=tolerance_pct,
-            include_rank2=rank2,
-            max_parts=max_parts,
-            built_only=built_only,
-            db_path=db_path,
-        )
-
-    return matches, combos
+    return search_orchestrated(
+        commune,
+        surface,
+        living_surface=living_surface,
+        dpe_label=dpe,
+        ges_label=ges,
+        postal_code=postal,
+        tolerance_pct=tolerance_pct,
+        db_path=db_path,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +341,19 @@ def _sidebar() -> dict | None:
     st.sidebar.title("Cadastre Finder")
     st.sidebar.caption("Recherche de parcelles par commune et surface")
     st.sidebar.write("")
+
+    # --- Analyse d'annonce ---
+    ad_text = st.sidebar.text_area(
+        "Annonce brute (optionnel)", 
+        placeholder="Collez l'annonce ici pour extraire les critères...",
+        help="Extrait automatiquement les surfaces et labels DPE/GES."
+    )
+    
+    extracted = None
+    if ad_text:
+        from cadastre_finder.search.ad_parser import parse_ad_text
+        extracted = parse_ad_text(ad_text)
+        st.sidebar.success("Critères extraits de l'annonce !")
 
     # Autocomplétion commune
     communes_list = _load_communes(str(DB_PATH))
@@ -343,9 +368,25 @@ def _sidebar() -> dict | None:
     else:
         commune = st.sidebar.text_input("Commune *", placeholder="ex : Neuvy-le-Roi")
 
+    # Champs de recherche avec valeurs par défaut extraites
+    def_surface = extracted.terrain_surface if extracted and extracted.terrain_surface else 5000.0
     surface = st.sidebar.number_input(
-        "Surface (m²) *", min_value=100, max_value=100_000, value=5_000, step=50
+        "Surface Terrain (m²) *", min_value=100.0, max_value=100_000.0, value=float(def_surface), step=50.0
     )
+    
+    def_living = extracted.living_surface if extracted and extracted.living_surface else None
+    living_surface = st.sidebar.number_input(
+        "Surface Habitable (m²)", min_value=0.0, max_value=2000.0, value=float(def_living) if def_living else 0.0, step=10.0
+    )
+    living_surface = living_surface if living_surface > 0 else None
+
+    c1, c2 = st.sidebar.columns(2)
+    def_dpe = extracted.dpe_label if extracted and extracted.dpe_label else None
+    dpe = c1.selectbox("DPE", options=[None, "A", "B", "C", "D", "E", "F", "G"], index=[None, "A", "B", "C", "D", "E", "F", "G"].index(def_dpe))
+    
+    def_ges = extracted.ges_label if extracted and extracted.ges_label else None
+    ges = c2.selectbox("GES", options=[None, "A", "B", "C", "D", "E", "F", "G"], index=[None, "A", "B", "C", "D", "E", "F", "G"].index(def_ges))
+
     postal = st.sidebar.text_input("Code postal", placeholder="optionnel")
 
     st.sidebar.divider()
@@ -353,10 +394,7 @@ def _sidebar() -> dict | None:
     tolerance_m2 = st.sidebar.number_input(
         "Tolérance ±m²", min_value=0, max_value=5_000, value=100, step=10
     )
-    max_parts = st.sidebar.slider("Max parcelles par combo", min_value=2, max_value=6, value=6)
-    rank2 = st.sidebar.checkbox("Communes voisines rang 2")
-    no_combo = st.sidebar.checkbox("Désactiver les combos")
-    include_agri = st.sidebar.checkbox("Inclure parcelles sans bâtiment")
+    rank2 = st.sidebar.checkbox("Communes voisines rang 2", value=True)
 
     st.sidebar.divider()
     launched = st.sidebar.button("Lancer la recherche", type="primary", use_container_width=True)
@@ -370,12 +408,12 @@ def _sidebar() -> dict | None:
     return {
         "commune": commune,
         "surface": float(surface),
+        "living_surface": living_surface,
+        "dpe": dpe,
+        "ges": ges,
         "postal": postal.strip() or None,
         "tolerance_m2": float(tolerance_m2),
-        "max_parts": int(max_parts),
         "rank2": rank2,
-        "no_combo": no_combo,
-        "include_agri": include_agri,
     }
 
 
@@ -402,25 +440,20 @@ def main() -> None:
 
     with st.spinner("Recherche en cours…"):
         try:
-            matches, combos = _run_search(
+            all_results = _run_search(
                 commune=p["commune"],
                 surface=p["surface"],
+                living_surface=p.get("living_surface"),
+                dpe=p.get("dpe"),
+                ges=p.get("ges"),
                 postal=p["postal"],
                 tolerance_m2=p["tolerance_m2"],
-                max_parts=p["max_parts"],
                 rank2=p["rank2"],
-                no_combo=p["no_combo"],
-                include_agri=p["include_agri"],
                 db_path_str=str(DB_PATH),
             )
         except Exception as exc:
             st.error(f"Erreur lors de la recherche : {exc}")
             return
-
-    all_results: list[Union[ParcelMatch, ComboMatch]] = sorted(
-        list(matches) + list(combos),
-        key=lambda r: -r.score,
-    )
 
     if not all_results:
         st.warning(

@@ -56,6 +56,41 @@ def cmd_ingest_osm(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ingest_dpe(args: argparse.Namespace) -> int:
+    from cadastre_finder.ingestion.dpe import download_dpe_data, load_dpe_to_duckdb
+    
+    csv_path = download_dpe_data()
+    load_dpe_to_duckdb(csv_path, db_path=Path(args.db))
+    return 0
+
+
+def cmd_build_database(args: argparse.Namespace) -> int:
+    """Construit toute la base en une commande : cadastre + OSM + DPE + adjacences."""
+    from cadastre_finder.ingestion.build_all import BuildOptions, build_database
+    from cadastre_finder.config import DEPARTMENTS, DATA_RAW
+
+    depts = args.dept if args.dept else list(DEPARTMENTS)
+    opts = BuildOptions(
+        db_path=Path(args.db),
+        raw_dir=Path(args.raw_dir) if args.raw_dir else DATA_RAW,
+        departments=depts,
+        skip_cadastre=args.skip_cadastre,
+        skip_osm=args.skip_osm,
+        skip_dpe=args.skip_dpe,
+        skip_adjacency=args.skip_adjacency,
+        skip_parcel_adjacency=args.skip_parcel_adjacency,
+        keep_intermediate_pbf=args.keep_intermediate_pbf,
+        duckdb_threads=args.threads,
+        duckdb_memory_limit=args.memory_limit,
+        cadastre_download_workers=args.download_workers,
+    )
+    bilan = build_database(opts)
+    # Code retour : 1 si une étape critique (cadastre) a échoué
+    if bilan.get("cadastre", {}).get("status") == "error":
+        return 1
+    return 0
+
+
 def cmd_build_adjacency(args: argparse.Namespace) -> int:
     from cadastre_finder.processing.adjacency import build_adjacency_table
 
@@ -81,67 +116,48 @@ def cmd_build_parcel_adjacency(args: argparse.Namespace) -> int:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    from cadastre_finder.search.strict_match import search_strict
-    from cadastre_finder.search.neighbor_match import search_with_neighbors
-    from cadastre_finder.search.combo_match import search_combos
+    from cadastre_finder.search.orchestrator import search_orchestrated, search_from_text
     from cadastre_finder.out.map import render_results
 
     db_path = Path(args.db)
-    commune = args.commune
-    surface = args.surface
-    postal = getattr(args, "postal", None)
-
-    built_only = not args.include_agricultural
-
-    # Étape 1 : match strict parcelles uniques
-    logger.info("=== Étape 1 : match strict ===")
-    matches = search_strict(commune, surface, postal_code=postal, built_only=built_only, db_path=db_path)
-
-    if 1 <= len(matches) <= 3:
-        logger.info(f"Succès étape 1 : {len(matches)} parcelle(s) trouvée(s).")
+    
+    if args.text:
+        logger.info("=== Recherche orchestrée depuis le texte de l'annonce ===")
+        all_results = search_from_text(args.text, commune_hint=args.commune, db_path=db_path)
+        # Extraction pour affichage
+        from cadastre_finder.search.ad_parser import parse_ad_text
+        criteria = parse_ad_text(args.text)
+        commune = args.commune or criteria.commune or "Inconnue"
+        surface = criteria.terrain_surface or 0
     else:
-        if not matches:
-            logger.info("Étape 1 vide → passage à l'étape 2.")
-        else:
-            logger.info(f"Étape 1 : {len(matches)} résultats (> 3). Élargissement étape 2.")
-
-        logger.info("=== Étape 2 : communes voisines ===")
-        matches = search_with_neighbors(
-            commune, surface,
-            postal_code=postal,
+        logger.info("=== Recherche orchestrée depuis paramètres manuels ===")
+        commune = args.commune
+        surface = args.surface
+        all_results = search_orchestrated(
+            commune=commune,
+            surface_m2=surface,
+            postal_code=getattr(args, "postal", None),
             tolerance_pct=args.tolerance,
-            include_rank2=args.rank2,
-            built_only=built_only,
-            db_path=db_path,
+            db_path=db_path
         )
 
-    # Étape combo : combinaisons de parcelles adjacentes (toujours)
-    combos = []
-    if not args.no_combo:
-        logger.info("=== Combos : parcelles adjacentes ===")
-        combos = search_combos(
-            commune, surface,
-            postal_code=postal,
-            tolerance_pct=args.tolerance,
-            include_rank2=args.rank2,
-            max_parts=args.max_parts,
-            built_only=built_only,
-            db_path=db_path,
-        )
-
-    if not matches and not combos:
+    if not all_results:
         logger.warning(
-            "Aucun résultat. Utilisez 'search-area' (étape 3) pour une "
+            "Aucun résultat. Utilisez 'search-area' pour une "
             "recherche par contraintes géométriques."
         )
         return 0
+
+    from cadastre_finder.search.models import ParcelMatch, ComboMatch
+    matches = [r for r in all_results if isinstance(r, ParcelMatch)]
+    combos = [r for r in all_results if isinstance(r, ComboMatch)]
 
     output_path = OUTPUT_DIR / f"result_{commune.replace(' ', '_')}.html"
     render_results(
         matches,
         output_path=output_path,
         combos=combos,
-        query_info={"commune": commune, "surface_m2": surface, "titre": "Résultats cadastre"},
+        query_info={"commune": commune, "surface_m2": surface, "titre": "Résultats cadastre (Orchestrés)"},
         auto_open=not args.no_open,
     )
     return 0
@@ -242,6 +258,47 @@ def main() -> None:
     p_osm.add_argument("--force", action="store_true", help="Vider et recharger les couches déjà présentes")
     p_osm.set_defaults(func=cmd_ingest_osm)
 
+    # ingest-dpe
+    p_dpe = sub.add_parser("ingest-dpe", help="Ingestion DPE ADEME (existants)")
+    p_dpe.set_defaults(func=cmd_ingest_dpe)
+
+    # build-database (orchestrateur unique)
+    p_build = sub.add_parser(
+        "build-database",
+        help="Construit toute la base en une commande (cadastre + OSM + DPE + adjacences)",
+        description=(
+            "Construction autonome et idempotente de l'intégralité de la base : "
+            "téléchargement automatique des PBF Geofabrik, ingestion cadastre Etalab "
+            "des 20 départements, OSM (POI/routes/bâtiments), DPE ADEME, et "
+            "pré-calculs d'adjacence. Heartbeat toutes les 60 s pour garantir la "
+            "vivacité des logs."
+        ),
+    )
+    p_build.add_argument(
+        "--dept", nargs="+", metavar="DEPT",
+        help="Sous-ensemble de départements (par défaut : les 20 du périmètre)",
+    )
+    p_build.add_argument("--raw-dir", help="Répertoire des fichiers raw (défaut : data/raw)")
+    p_build.add_argument("--skip-cadastre", action="store_true",
+                         help="Ne pas (ré)ingérer les parcelles cadastre")
+    p_build.add_argument("--skip-osm", action="store_true",
+                         help="Ne pas (ré)ingérer les couches OSM")
+    p_build.add_argument("--skip-dpe", action="store_true",
+                         help="Ne pas (ré)ingérer les données DPE")
+    p_build.add_argument("--skip-adjacency", action="store_true",
+                         help="Ne pas calculer l'adjacence des communes")
+    p_build.add_argument("--skip-parcel-adjacency", action="store_true",
+                         help="Ne pas calculer l'adjacence des parcelles (étape la plus longue)")
+    p_build.add_argument("--keep-intermediate-pbf", action="store_true",
+                         help="Conserver les PBF régionaux et le fichier merged après extraction")
+    p_build.add_argument("--threads", type=int, default=None,
+                         help="Threads DuckDB (défaut : nombre de cœurs logiques)")
+    p_build.add_argument("--memory-limit", default="24GB",
+                         help="Limite mémoire DuckDB (défaut : 24GB)")
+    p_build.add_argument("--download-workers", type=int, default=8,
+                         help="Téléchargements cadastre concurrents (défaut : 8)")
+    p_build.set_defaults(func=cmd_build_database)
+
     # build-adjacency
     p_adj = sub.add_parser("build-adjacency", help="Calcul table d'adjacence communes")
     p_adj.add_argument("--no-rank2", action="store_true", help="Ne pas calculer le rang 2")
@@ -255,9 +312,10 @@ def main() -> None:
     p_padj.set_defaults(func=cmd_build_parcel_adjacency)
 
     # search
-    p_search = sub.add_parser("search", help="Recherche par commune + surface (étapes 1 et 2)")
-    p_search.add_argument("--commune", required=True, help="Nom de la commune annoncée")
-    p_search.add_argument("--surface", required=True, type=float, help="Surface en m²")
+    p_search = sub.add_parser("search", help="Recherche orchestrée (Phase 1-4)")
+    p_search.add_argument("--commune", help="Nom de la commune annoncée")
+    p_search.add_argument("--surface", type=float, help="Surface en m²")
+    p_search.add_argument("--text", help="Texte de l'annonce immobilière (extraction auto)")
     p_search.add_argument("--postal", help="Code postal (optionnel, pour désambiguïser)")
     p_search.add_argument("--tolerance", type=float, default=5.0, help="Tolérance surface en pourcent")
     p_search.add_argument("--rank2", action="store_true", help="Inclure voisines rang 2")
