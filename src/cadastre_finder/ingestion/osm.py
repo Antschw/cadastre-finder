@@ -219,18 +219,12 @@ def _stream_pbf_to_duckdb(
 ) -> int:
     """Lit un PBF filtré et écrit dans DuckDB par batches de 50k lignes.
 
-    Utilise un index de nœuds sur disque (sparse_file_array) pour éviter
-    de saturer la RAM sur les grosses couches (buildings, roads_major).
+    Utilise sparse_mem_array (RAM) pour la reconstruction des géométries way/area.
+    Fonctionne bien sur des extraits régionaux (<500 MB PBF).
+    Sur le PBF France entier, préférer un extrait régional préalable avec osmium extract.
     """
-    import tempfile
     handler = _BatchGeomHandler(con, layer_name)
-    with tempfile.TemporaryDirectory() as idx_dir:
-        idx_path = Path(idx_dir) / "locations.idx"
-        handler.apply_file(
-            str(pbf_path),
-            locations=True,
-            idx=f"sparse_file_array,{idx_path}",
-        )
+    handler.apply_file(str(pbf_path), locations=True, idx="sparse_mem_array")
     return handler.finalize()
 
 
@@ -266,8 +260,14 @@ def load_osm_to_duckdb(
     pbf_path: Path,
     db_path: Path = DB_PATH,
     layers: list[str] | None = None,
+    force: bool = False,
 ) -> None:
-    """Filtre le fichier OSM PBF et charge les couches utiles dans DuckDB."""
+    """Filtre le fichier OSM PBF et charge les couches utiles dans DuckDB.
+
+    Args:
+        force: si True, vide et recharge les couches déjà présentes.
+               Utile pour corriger une ingestion précédente défectueuse.
+    """
     if not pbf_path.exists():
         raise FileNotFoundError(f"Fichier OSM introuvable : {pbf_path}")
 
@@ -287,18 +287,20 @@ def load_osm_to_duckdb(
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             for layer_name, layer_config in tqdm(target_layers.items(), desc="Couches OSM"):
-                # Vérification idempotence
                 count = con.execute(f"SELECT COUNT(*) FROM {layer_name}").fetchone()[0]
                 if count > 0:
-                    logger.info(f"[osm] {layer_name} déjà chargé ({count} entités). Skip.")
-                    continue
+                    if not force:
+                        logger.info(f"[osm] {layer_name} déjà chargé ({count:,} entités). Skip. Utilisez --force pour recharger.")
+                        continue
+                    logger.info(f"[osm] --force : purge de {layer_name} ({count:,} entités)...")
+                    con.execute(f"DELETE FROM {layer_name}")
 
                 pbf_filtered = _filter_to_pbf(
                     pbf_path, layer_name, layer_config, osmium_cmd, tmp_dir
                 )
                 logger.info(f"[osm] Lecture {layer_name} (batches de {BATCH_SIZE:,})...")
                 n = _stream_pbf_to_duckdb(pbf_filtered, con, layer_name)
-                logger.info(f"[osm] {layer_name} : {n} entités chargées.")
+                logger.info(f"[osm] {layer_name} : {n:,} entités chargées.")
     finally:
         con.close()
 

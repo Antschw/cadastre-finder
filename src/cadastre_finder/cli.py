@@ -51,6 +51,7 @@ def cmd_ingest_osm(args: argparse.Namespace) -> int:
         pbf_path=Path(args.pbf),
         db_path=Path(args.db),
         layers=args.layers or None,
+        force=args.force,
     )
     return 0
 
@@ -69,7 +70,13 @@ def cmd_build_parcel_adjacency(args: argparse.Namespace) -> int:
     from cadastre_finder.processing.parcel_adjacency import build_parcel_adjacency
 
     depts = args.dept if args.dept else None
-    build_parcel_adjacency(db_path=Path(args.db), departments=depts)
+    communes = args.communes if args.communes else None
+    build_parcel_adjacency(
+        db_path=Path(args.db),
+        departments=depts,
+        communes=communes,
+        force=args.force,
+    )
     return 0
 
 
@@ -232,6 +239,7 @@ def main() -> None:
     p_osm = sub.add_parser("ingest-osm", help="Ingestion OSM (POI, routes, rivières)")
     p_osm.add_argument("--pbf", required=True, help="Chemin du fichier .osm.pbf")
     p_osm.add_argument("--layers", nargs="*", help="Couches à charger (toutes par défaut)")
+    p_osm.add_argument("--force", action="store_true", help="Vider et recharger les couches déjà présentes")
     p_osm.set_defaults(func=cmd_ingest_osm)
 
     # build-adjacency
@@ -242,6 +250,8 @@ def main() -> None:
     # build-parcel-adjacency
     p_padj = sub.add_parser("build-parcel-adjacency", help="Pré-calcul table d'adjacence parcellaire (accélère search --combos)")
     p_padj.add_argument("--dept", nargs="+", metavar="DEPT", help="Limiter à ces départements")
+    p_padj.add_argument("--communes", nargs="+", metavar="INSEE", help="Reconstruire uniquement ces codes INSEE (ex: 28103)")
+    p_padj.add_argument("--force", action="store_true", help="Effacer et recalculer les communes déjà traitées")
     p_padj.set_defaults(func=cmd_build_parcel_adjacency)
 
     # search

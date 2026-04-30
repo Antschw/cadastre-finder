@@ -21,9 +21,9 @@ from cadastre_finder.search.building_filter import filter_built_combos
 from cadastre_finder.search.models import ComboMatch, ParcelMatch
 from cadastre_finder.utils.geocoding import resolve_commune
 
-MIN_PART_M2 = 10        # On garde même les toutes petites parcelles (ex : 15 m² de Neuvy-le-Roi)
+MIN_PART_M2 = 10        # Seuil absolu minimum (parcelles accessoires très petites)
 MAX_PARTS = 6           # Couvre les cas de maisons découpées en 6 parcelles
-MAX_DFS_NODES = 200_000 # Plafond de nœuds explorés pour éviter les explosions combinatoires
+MAX_DFS_NODES = 500_000 # Plafond de nœuds explorés pour éviter les explosions combinatoires
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +33,7 @@ MAX_DFS_NODES = 200_000 # Plafond de nœuds explorés pour éviter les explosion
 def _fetch_candidates(
     con: duckdb.DuckDBPyConnection,
     codes_insee: list[str],
+    min_contenance: float,
     max_contenance: float,
     commune_noms: dict[str, str],
 ) -> list[ParcelMatch]:
@@ -48,7 +49,7 @@ def _fetch_candidates(
           AND contenance >= ?
           AND contenance <= ?
         ORDER BY contenance DESC
-    """, [*codes_insee, MIN_PART_M2, max_contenance]).fetchall()
+    """, [*codes_insee, min_contenance, max_contenance]).fetchall()
 
     return [
         ParcelMatch(
@@ -260,8 +261,6 @@ def _find_combos_dfs(
         if lo <= total <= hi and len(combo) >= 2:
             parts = [candidates[i] for i in combo]
             results.append(_build_combo(parts, target_m2))
-            if len(results) >= top_n * 5:
-                return
 
         if total >= hi or len(combo) >= max_parts:
             return
@@ -294,6 +293,28 @@ def _find_combos_dfs(
 
     results.sort(key=lambda c: (-c.score, abs(c.total_contenance - target_m2)))
     return results[:top_n]
+
+
+# ---------------------------------------------------------------------------
+# Déduplication : parmi les combos qui partagent des parcelles, garder le plus proche
+# ---------------------------------------------------------------------------
+
+def _deduplicate_combos(combos: list[ComboMatch], target_m2: float) -> list[ComboMatch]:
+    """Élimine les combos redondants : si un combo A est un sous-ensemble ou sur-ensemble
+    d'un combo B déjà retenu et plus proche de la cible, A est éliminé.
+
+    Deux combos qui partagent des parcelles sans relation d'inclusion sont conservés tous
+    les deux — ils peuvent représenter des propriétés différentes sur un même terrain.
+    """
+    sorted_combos = sorted(combos, key=lambda c: abs(c.total_contenance - target_m2))
+    kept: list[ComboMatch] = []
+    kept_sets: list[frozenset[str]] = []
+    for combo in sorted_combos:
+        ids = frozenset(p.id_parcelle for p in combo.parts)
+        if not any(ids.issubset(ks) or ids.issuperset(ks) for ks in kept_sets):
+            kept.append(combo)
+            kept_sets.append(ids)
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -347,16 +368,20 @@ def search_combos(
         commune_noms = {r[0]: r[1] for r in nom_rows}
         commune_noms[code_insee_main] = nom_main
 
-        # Borne haute par parcelle individuelle : si on prend max_parts parcelles,
-        # chacune doit pouvoir laisser de la place aux autres (au moins MIN_PART_M2 chacune)
+        # Borne haute : chaque parcelle doit laisser de la place aux autres
         max_single = surface_m2 * (1 + tolerance_pct / 100.0) - (max_parts - 1) * MIN_PART_M2
+
+        # Borne basse : seuil pour éliminer les parcelles insignifiantes (voirie, etc.)
+        # On utilise un facteur large pour ne pas exclure de vraies parcelles de jardin/garage.
+        min_single = max(MIN_PART_M2, int(surface_m2 / 500))
 
         logger.info(
             f"[combo_match] Recherche combos sur {len(all_codes)} commune(s), "
-            f"cible {surface_m2:.0f} m² ±{tolerance_pct}%, max {max_parts} parcelles"
+            f"cible {surface_m2:.0f} m² ±{tolerance_pct}%, max {max_parts} parcelles, "
+            f"candidats [{min_single}–{max_single:.0f}] m²"
         )
 
-        candidates = _fetch_candidates(con, all_codes, max_single, commune_noms)
+        candidates = _fetch_candidates(con, all_codes, min_single, max_single, commune_noms)
         logger.info(f"[combo_match] {len(candidates)} parcelles candidates")
 
         if not candidates:
@@ -368,6 +393,7 @@ def search_combos(
         )
 
         combos = _find_combos_dfs(candidates, graph, surface_m2, tolerance_pct, max_parts, top_n * 3)
+        combos = _deduplicate_combos(combos, surface_m2)
 
         if built_only:
             combos = filter_built_combos(combos, con)

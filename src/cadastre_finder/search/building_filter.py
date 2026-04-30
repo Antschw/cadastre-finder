@@ -35,6 +35,13 @@ def filter_built_parcels(
     built_ids = {r[0] for r in rows}
     filtered = [m for m in matches if m.id_parcelle in built_ids]
 
+    if not filtered and matches:
+        logger.warning(
+            "[building_filter] Aucune parcelle bâtie trouvée — données bâtiments manquantes "
+            "pour cette zone. Filtre désactivé."
+        )
+        return matches
+
     removed = len(matches) - len(filtered)
     if removed:
         logger.info(f"[building_filter] {removed} parcelle(s) non bâtie(s) exclue(s).")
@@ -69,6 +76,13 @@ def filter_built_combos(
 
     built_ids = {r[0] for r in rows}
     filtered = [c for c in combos if any(p.id_parcelle in built_ids for p in c.parts)]
+
+    if not filtered and combos:
+        logger.warning(
+            "[building_filter] Aucun combo bâti trouvé — données bâtiments manquantes "
+            "pour cette zone. Filtre désactivé."
+        )
+        return combos
 
     removed = len(combos) - len(filtered)
     if removed:

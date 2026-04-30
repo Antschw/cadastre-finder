@@ -6,84 +6,115 @@ Lancement : cadastre-finder ui
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 from typing import Union
 
+import duckdb
 import folium
 import streamlit as st
 import streamlit.components.v1 as components
 
-from cadastre_finder.config import DB_PATH, DEFAULT_TOLERANCE_PCT, DEFAULT_TOP_N
+from cadastre_finder.config import DB_PATH
 from cadastre_finder.search.models import ComboMatch, ParcelMatch
 
 # ---------------------------------------------------------------------------
-# Config page
+# Configuration de la page
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="Cadastre Finder",
-    page_icon="🏡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-_CSS = """
+st.markdown("""
 <style>
-.result-card {
-    background: #f8f9fa;
-    border: 1px solid #dee2e6;
-    border-radius: 8px;
-    padding: 16px;
-    margin-bottom: 8px;
-}
-.score-badge {
-    display: inline-block;
-    padding: 2px 10px;
-    border-radius: 12px;
-    font-weight: bold;
-    font-size: 1rem;
-    color: white;
-}
-.nav-bar {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 12px;
-}
+  /* Retire le padding top excessif de Streamlit */
+  .block-container { padding-top: 1.5rem; }
+
+  /* Carte info résultat */
+  .info-card {
+      background: #ffffff;
+      border: 1px solid #e0e0e0;
+      border-radius: 6px;
+      padding: 1rem 1.2rem;
+  }
+
+  /* Indicateur de score coloré */
+  .score-pill {
+      display: inline-block;
+      padding: 3px 12px;
+      border-radius: 20px;
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: #fff;
+      letter-spacing: 0.02em;
+  }
+
+  /* Barre de navigation résultats */
+  div[data-testid="stHorizontalBlock"] > div:first-child button,
+  div[data-testid="stHorizontalBlock"] > div:last-child button {
+      width: 100%;
+  }
 </style>
-"""
-st.markdown(_CSS, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
-# Helpers visuels
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _score_color(score: float) -> str:
     if score >= 100:
-        return "#1a9641"
+        return "#2e7d32"
     elif score >= 80:
-        return "#a6d96a"
+        return "#558b2f"
     elif score >= 60:
-        return "#e8c200"
+        return "#f9a825"
     elif score >= 40:
-        return "#fdae61"
+        return "#e65100"
     else:
-        return "#d7191c"
+        return "#c62828"
 
 
 def _rang_label(rank: int) -> str:
     return {0: "Commune annoncée", 1: "Voisine rang 1", 2: "Voisine rang 2"}.get(rank, f"Rang {rank}")
 
 
-def _make_mini_map(result: Union[ParcelMatch, ComboMatch], height: int = 420) -> str:
-    """Génère une carte Folium pour un seul résultat et renvoie le HTML."""
-    if isinstance(result, ComboMatch):
-        lat, lon = result.centroid_lat, result.centroid_lon
-    else:
-        lat, lon = result.centroid_lat, result.centroid_lon
+def _score_progress(score: float) -> float:
+    """Normalise le score pour st.progress (0–1). Les scores peuvent dépasser 100."""
+    return min(max(score / 118.0, 0.0), 1.0)
 
+
+# ---------------------------------------------------------------------------
+# Chargement des communes pour l'autocomplétion
+# ---------------------------------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def _load_communes(db_path_str: str) -> list[str]:
+    """Charge la liste des communes depuis la base. Retourne ["Nom (dept)", ...]."""
+    try:
+        con = duckdb.connect(db_path_str, read_only=True)
+        rows = con.execute(
+            "SELECT nom, code_dept FROM communes ORDER BY nom"
+        ).fetchall()
+        con.close()
+        return [f"{nom} ({dept})" for nom, dept in rows]
+    except Exception:
+        return []
+
+
+def _extract_commune_name(label: str) -> str:
+    """Extrait le nom de commune depuis le label 'Nom (dept)'."""
+    return label.rsplit(" (", 1)[0] if " (" in label else label
+
+
+# ---------------------------------------------------------------------------
+# Carte Folium pour un seul résultat
+# ---------------------------------------------------------------------------
+
+def _make_mini_map(result: Union[ParcelMatch, ComboMatch]) -> str:
+    lat, lon = result.centroid_lat, result.centroid_lon
     fmap = folium.Map(location=[lat, lon], zoom_start=17, tiles="OpenStreetMap")
     folium.TileLayer(
         tiles=(
@@ -102,33 +133,30 @@ def _make_mini_map(result: Union[ParcelMatch, ComboMatch], height: int = 420) ->
     ).add_to(fmap)
 
     if isinstance(result, ComboMatch):
-        color, border = "#8B008B", "#4B0082"
         try:
-            geom = json.loads(result.combined_geojson)
             folium.GeoJson(
-                geom,
+                json.loads(result.combined_geojson),
                 style_function=lambda _: {
-                    "fillColor": color,
-                    "color": border,
-                    "weight": 3,
-                    "fillOpacity": 0.5,
+                    "fillColor": "#7b1fa2",
+                    "color": "#4a148c",
+                    "weight": 2.5,
+                    "fillOpacity": 0.45,
                     "dashArray": "6 3",
                 },
             ).add_to(fmap)
         except Exception:
-            folium.Marker(location=[lat, lon], icon=folium.Icon(color="purple")).add_to(fmap)
+            folium.Marker(location=[lat, lon]).add_to(fmap)
     else:
         color = _score_color(result.score)
         try:
-            geom = json.loads(result.geometry_geojson)
             folium.GeoJson(
-                geom,
+                json.loads(result.geometry_geojson),
                 style_function=lambda _, c=color: {
-                    "fillColor": c, "color": "#333", "weight": 2, "fillOpacity": 0.55,
+                    "fillColor": c, "color": "#333", "weight": 2, "fillOpacity": 0.5,
                 },
             ).add_to(fmap)
         except Exception:
-            folium.Marker(location=[lat, lon], icon=folium.Icon(color="blue")).add_to(fmap)
+            folium.Marker(location=[lat, lon]).add_to(fmap)
 
     folium.LayerControl(collapsed=True).add_to(fmap)
     return fmap._repr_html_()
@@ -139,143 +167,119 @@ def _make_mini_map(result: Union[ParcelMatch, ComboMatch], height: int = 420) ->
 # ---------------------------------------------------------------------------
 
 def _display_result(result: Union[ParcelMatch, ComboMatch], idx: int, total: int) -> None:
-    score = result.score
-    badge_color = _score_color(score)
-
-    col_nav1, col_nav2, col_nav3 = st.columns([1, 6, 1])
-    with col_nav1:
-        if st.button("◀ Précédent", disabled=(idx == 0), key="prev"):
-            st.session_state.result_idx = max(0, idx - 1)
+    # Navigation
+    c_prev, c_counter, c_next = st.columns([1, 4, 1])
+    with c_prev:
+        if st.button("← Précédent", disabled=(idx == 0), use_container_width=True, key="btn_prev"):
+            st.session_state.result_idx = idx - 1
             st.rerun()
-    with col_nav2:
+    with c_counter:
         st.markdown(
-            f"<div style='text-align:center;padding-top:6px;font-size:0.95rem;color:#555;'>"
-            f"Résultat <b>{idx + 1}</b> / {total}</div>",
+            f"<p style='text-align:center;margin:0;padding-top:6px;color:#555;'>"
+            f"Résultat <strong>{idx + 1}</strong> sur {total}</p>",
             unsafe_allow_html=True,
         )
-    with col_nav3:
-        if st.button("Suivant ▶", disabled=(idx == total - 1), key="next"):
-            st.session_state.result_idx = min(total - 1, idx + 1)
+    with c_next:
+        if st.button("Suivant →", disabled=(idx == total - 1), use_container_width=True, key="btn_next"):
+            st.session_state.result_idx = idx + 1
             st.rerun()
 
-    st.markdown(
-        f"<span class='score-badge' style='background:{badge_color};'>Score : {score:.1f}</span> &nbsp;"
-        f"<span style='color:#555;font-size:0.9rem;'>{_rang_label(result.rank)}</span>",
-        unsafe_allow_html=True,
-    )
     st.write("")
 
-    col_info, col_map = st.columns([1, 2])
+    col_info, col_map = st.columns([1, 2], gap="medium")
 
     with col_info:
+        score = result.score
+        color = _score_color(score)
+
+        # Score
+        st.markdown(
+            f"<span class='score-pill' style='background:{color};'>Score {score:.1f}</span>"
+            f"&nbsp; <span style='color:#666;font-size:0.9rem;'>{_rang_label(result.rank)}</span>",
+            unsafe_allow_html=True,
+        )
+        st.progress(_score_progress(score))
+        st.write("")
+
         if isinstance(result, ComboMatch):
-            st.markdown(f"### 🔗 Combinaison de {result.nb_parcelles} parcelles")
-            st.markdown(f"**Commune :** {result.nom_commune} `{result.code_insee}`")
-            st.markdown(f"**Surface totale :** {result.total_contenance:,} m²")
+            st.markdown(f"**Combinaison** de {result.nb_parcelles} parcelles")
+            st.metric("Surface totale", f"{result.total_contenance:,} m²")
+            st.metric("Commune", f"{result.nom_commune} ({result.code_insee})")
 
             pp = result.compactness
-            if pp >= 0.5:
-                pp_label, pp_color = "bonne", "green"
-            elif pp >= 0.2:
-                pp_label, pp_color = "moyenne", "orange"
-            else:
-                pp_label, pp_color = "faible", "red"
+            pp_color = "#2e7d32" if pp >= 0.5 else ("#e65100" if pp < 0.2 else "#f9a825")
             st.markdown(
-                f"**Compacité :** :{pp_color}[{pp:.2f}] ({pp_label})"
+                f"**Compacité** : "
+                f"<span style='color:{pp_color};font-weight:600;'>{pp:.2f}</span>",
+                unsafe_allow_html=True,
             )
 
-            st.markdown("**Parcelles :**")
+            st.write("")
+            st.markdown("**Parcelles**")
             for p in result.parts:
-                st.markdown(f"- `{p.id_parcelle}` — {p.contenance:,} m²")
+                st.markdown(
+                    f"<div style='font-size:0.85rem;padding:2px 0;"
+                    f"border-bottom:1px solid #f0f0f0;'>"
+                    f"<code>{p.id_parcelle}</code> &nbsp; {p.contenance:,} m²</div>",
+                    unsafe_allow_html=True,
+                )
 
-            st.markdown(f"[Ouvrir sur Géoportail]({result.geoportail_url})")
+            st.write("")
+            st.link_button("Ouvrir sur Géoportail", result.geoportail_url)
 
         else:
-            st.markdown(f"### 🏡 Parcelle `{result.id_parcelle}`")
-            st.markdown(f"**Commune :** {result.nom_commune} `{result.code_insee}`")
-            st.markdown(f"**Surface :** {result.contenance:,} m²")
-            st.markdown(
-                f"[Street View]({result.street_view_url}) &nbsp;|&nbsp; "
-                f"[Géoportail]({result.geoportail_url})"
-            )
+            st.markdown(f"**Parcelle** individuelle")
+            st.metric("Surface", f"{result.contenance:,} m²")
+            st.metric("Commune", f"{result.nom_commune} ({result.code_insee})")
+            st.metric("Identifiant", result.id_parcelle)
+
+            st.write("")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.link_button("Géoportail", result.geoportail_url)
+            with c2:
+                st.link_button("Street View", result.street_view_url)
 
     with col_map:
-        html = _make_mini_map(result)
-        components.html(html, height=420, scrolling=False)
+        components.html(_make_mini_map(result), height=480, scrolling=False)
 
 
 # ---------------------------------------------------------------------------
-# Sidebar : formulaire de recherche
-# ---------------------------------------------------------------------------
-
-def _sidebar() -> dict | None:
-    st.sidebar.title("🔍 Recherche cadastrale")
-
-    commune = st.sidebar.text_input("Commune annoncée *", placeholder="ex : Neuvy-le-Roi")
-    surface = st.sidebar.number_input("Surface en m² *", min_value=100, max_value=100_000, value=5000, step=50)
-    postal = st.sidebar.text_input("Code postal (optionnel)", placeholder="ex : 37370")
-
-    st.sidebar.markdown("---")
-    tolerance = st.sidebar.slider("Tolérance surface (%)", min_value=1, max_value=30, value=5)
-    max_parts = st.sidebar.slider("Taille max des combos", min_value=2, max_value=6, value=6)
-    rank2 = st.sidebar.checkbox("Inclure communes voisines rang 2", value=False)
-    no_combo = st.sidebar.checkbox("Désactiver la recherche de combos", value=False)
-    include_agri = st.sidebar.checkbox("Inclure parcelles sans bâtiment", value=False)
-
-    st.sidebar.markdown("---")
-    launched = st.sidebar.button("🚀 Lancer la recherche", type="primary", use_container_width=True)
-
-    if not launched:
-        return None
-    if not commune or not commune.strip():
-        st.sidebar.error("La commune est obligatoire.")
-        return None
-
-    return {
-        "commune": commune.strip(),
-        "surface": float(surface),
-        "postal": postal.strip() or None,
-        "tolerance": float(tolerance),
-        "max_parts": int(max_parts),
-        "rank2": rank2,
-        "no_combo": no_combo,
-        "include_agri": include_agri,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Barre de résultats (synthèse)
+# Barre de résultats (vue d'ensemble)
 # ---------------------------------------------------------------------------
 
 def _results_overview(
     all_results: list[Union[ParcelMatch, ComboMatch]],
     current_idx: int,
 ) -> None:
-    st.markdown(f"**{len(all_results)} résultat(s) trouvé(s)**, triés par score décroissant.")
-    cols = st.columns(min(len(all_results), 10))
-    for i, (col, r) in enumerate(zip(cols, all_results[:10])):
+    n = len(all_results)
+    visible = min(n, 12)
+    cols = st.columns(visible)
+    for i, (col, r) in enumerate(zip(cols, all_results[:visible])):
         with col:
             color = _score_color(r.score)
             label = "C" if isinstance(r, ComboMatch) else "P"
-            style = "border: 3px solid #1976D2;" if i == current_idx else ""
+            border = "border:2px solid #1565c0;" if i == current_idx else "border:2px solid transparent;"
             st.markdown(
-                f"<div style='text-align:center;background:{color};color:white;"
-                f"border-radius:6px;padding:4px;cursor:pointer;{style}'>"
-                f"<b>{label}</b><br>{r.score:.0f}</div>",
+                f"<div style='text-align:center;background:{color};color:#fff;"
+                f"border-radius:4px;padding:5px 2px;font-size:0.78rem;{border}'>"
+                f"{label}<br><strong>{r.score:.0f}</strong></div>",
                 unsafe_allow_html=True,
             )
+    if n > visible:
+        st.caption(f"… et {n - visible} autres résultats")
 
 
 # ---------------------------------------------------------------------------
-# Logique de recherche
+# Recherche
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Recherche en cours…", ttl=300)
+@st.cache_data(show_spinner=False, ttl=300)
 def _run_search(
     commune: str,
     surface: float,
     postal: str | None,
-    tolerance: float,
+    tolerance_m2: float,
     max_parts: int,
     rank2: bool,
     no_combo: bool,
@@ -288,6 +292,7 @@ def _run_search(
 
     db_path = Path(db_path_str)
     built_only = not include_agri
+    tolerance_pct = (tolerance_m2 / surface * 100.0) if surface > 0 else 0.0
 
     matches = search_strict(commune, surface, postal_code=postal, built_only=built_only, db_path=db_path)
 
@@ -295,7 +300,7 @@ def _run_search(
         matches = search_with_neighbors(
             commune, surface,
             postal_code=postal,
-            tolerance_pct=tolerance,
+            tolerance_pct=tolerance_pct,
             include_rank2=rank2,
             built_only=built_only,
             db_path=db_path,
@@ -306,7 +311,7 @@ def _run_search(
         combos = search_combos(
             commune, surface,
             postal_code=postal,
-            tolerance_pct=tolerance,
+            tolerance_pct=tolerance_pct,
             include_rank2=rank2,
             max_parts=max_parts,
             built_only=built_only,
@@ -314,6 +319,64 @@ def _run_search(
         )
 
     return matches, combos
+
+
+# ---------------------------------------------------------------------------
+# Formulaire sidebar
+# ---------------------------------------------------------------------------
+
+def _sidebar() -> dict | None:
+    st.sidebar.title("Cadastre Finder")
+    st.sidebar.caption("Recherche de parcelles par commune et surface")
+    st.sidebar.write("")
+
+    # Autocomplétion commune
+    communes_list = _load_communes(str(DB_PATH))
+    if communes_list:
+        selected_label = st.sidebar.selectbox(
+            "Commune *",
+            options=communes_list,
+            index=None,
+            placeholder="Tapez pour filtrer…",
+        )
+        commune = _extract_commune_name(selected_label) if selected_label else ""
+    else:
+        commune = st.sidebar.text_input("Commune *", placeholder="ex : Neuvy-le-Roi")
+
+    surface = st.sidebar.number_input(
+        "Surface (m²) *", min_value=100, max_value=100_000, value=5_000, step=50
+    )
+    postal = st.sidebar.text_input("Code postal", placeholder="optionnel")
+
+    st.sidebar.divider()
+
+    tolerance_m2 = st.sidebar.number_input(
+        "Tolérance ±m²", min_value=0, max_value=5_000, value=100, step=10
+    )
+    max_parts = st.sidebar.slider("Max parcelles par combo", min_value=2, max_value=6, value=6)
+    rank2 = st.sidebar.checkbox("Communes voisines rang 2")
+    no_combo = st.sidebar.checkbox("Désactiver les combos")
+    include_agri = st.sidebar.checkbox("Inclure parcelles sans bâtiment")
+
+    st.sidebar.divider()
+    launched = st.sidebar.button("Lancer la recherche", type="primary", use_container_width=True)
+
+    if not launched:
+        return None
+    if not commune:
+        st.sidebar.error("La commune est obligatoire.")
+        return None
+
+    return {
+        "commune": commune,
+        "surface": float(surface),
+        "postal": postal.strip() or None,
+        "tolerance_m2": float(tolerance_m2),
+        "max_parts": int(max_parts),
+        "rank2": rank2,
+        "no_combo": no_combo,
+        "include_agri": include_agri,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -326,13 +389,12 @@ def main() -> None:
     if params is not None:
         st.session_state.search_params = params
         st.session_state.result_idx = 0
-        st.session_state.search_done = False
 
     if "search_params" not in st.session_state:
-        st.markdown("## 🏡 Cadastre Finder")
+        st.title("Cadastre Finder")
         st.markdown(
-            "Renseignez la **commune** et la **surface** dans le panneau de gauche, "
-            "puis cliquez sur **Lancer la recherche**."
+            "Sélectionnez une **commune** et une **surface** dans le panneau de gauche, "
+            "puis lancez la recherche."
         )
         return
 
@@ -344,7 +406,7 @@ def main() -> None:
                 commune=p["commune"],
                 surface=p["surface"],
                 postal=p["postal"],
-                tolerance=p["tolerance"],
+                tolerance_m2=p["tolerance_m2"],
                 max_parts=p["max_parts"],
                 rank2=p["rank2"],
                 no_combo=p["no_combo"],
@@ -355,7 +417,6 @@ def main() -> None:
             st.error(f"Erreur lors de la recherche : {exc}")
             return
 
-    # Fusionner et trier par score décroissant
     all_results: list[Union[ParcelMatch, ComboMatch]] = sorted(
         list(matches) + list(combos),
         key=lambda r: -r.score,
@@ -363,8 +424,7 @@ def main() -> None:
 
     if not all_results:
         st.warning(
-            "Aucun résultat trouvé. Essayez d'augmenter la tolérance surface "
-            "ou d'activer les communes voisines rang 2."
+            "Aucun résultat. Augmentez la tolérance ou activez les communes voisines rang 2."
         )
         return
 
@@ -372,9 +432,10 @@ def main() -> None:
     idx = max(0, min(idx, len(all_results) - 1))
     st.session_state.result_idx = idx
 
-    st.markdown(f"## Résultats — {p['commune']} · {p['surface']:,.0f} m²")
+    st.subheader(f"{p['commune']} · {p['surface']:,.0f} m²")
+    st.caption(f"{len(all_results)} résultat(s) — triés par score")
     _results_overview(all_results, idx)
-    st.markdown("---")
+    st.divider()
     _display_result(all_results[idx], idx, len(all_results))
 
 
