@@ -1,30 +1,30 @@
 """Pré-calcul de la table d'adjacence des parcelles cadastrales.
 
 Approche : Python + Shapely STRtree (O(n log n) par commune, mémoire contrôlée),
-parallélisé sur N processus (un par cœur). Les géométries sont pré-chargées en
-mémoire dans le thread principal avant de lancer les workers — les workers n'ouvrent
-jamais DuckDB, ce qui évite le verrou exclusif sur Windows.
+parallélisé sur N processus (un par cœur). Les géométries sont chargées par lots
+(_COMPUTE_BATCH communes) en WKB binaire pour limiter l'empreinte RAM. Les workers
+reçoivent des données Python pures et n'ouvrent jamais DuckDB.
 
 Usage CLI : cadastre-finder build-parcel-adjacency [--dept 61] [--workers 8]
 """
 from __future__ import annotations
 
-import json
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import duckdb
 from loguru import logger
-from shapely.geometry import shape
 from shapely.strtree import STRtree
+from shapely.wkb import loads as wkb_loads
 from tqdm import tqdm
 
 from cadastre_finder.config import DB_PATH
 
 _CHECKPOINT_EVERY = 50
-_BATCH_INSERT = 20_000
+_BATCH_INSERT = 50_000
 _LOAD_BATCH = 500       # communes chargées par requête SQL (évite un IN() trop long)
+_COMPUTE_BATCH = 200    # communes traitées par lot (contrôle l'empreinte mémoire)
 # Buffer en degrés WGS84 pour combler les micro-gaps cadastraux (~1 m à 47°N)
 _BUFFER_DEG = 0.000009
 
@@ -46,7 +46,6 @@ def build_parcel_adjacency(
     """
     workers = workers or max(1, (os.cpu_count() or 2) - 1)
 
-    # 1. Liste des communes cibles + filtre idempotence
     con = duckdb.connect(str(db_path))
     try:
         con.execute("INSTALL spatial; LOAD spatial;")
@@ -73,59 +72,60 @@ def build_parcel_adjacency(
         if not todo:
             return
 
-        # Pré-chargement de toutes les géométries en mémoire.
-        # Les workers ne toucheront jamais DuckDB → pas de conflit de verrou Windows.
-        logger.info("[parcel_adj] Chargement des géométries en mémoire...")
-        commune_data = _load_commune_geometries(con, todo)
-    finally:
-        con.close()
-
-    # 2. Calcul parallèle — workers reçoivent des données Python pures
-    write_con = duckdb.connect(str(db_path))
-    try:
-        write_con.execute("INSTALL spatial; LOAD spatial;")
         total_pairs = 0
         completed = 0
 
-        tasks = [
-            (code, commune_data.get(code, []))
-            for code in todo
-            if len(commune_data.get(code, [])) >= 2
-        ]
-
+        # Le pool est créé UNE SEULE FOIS : sur Windows (spawn), chaque création
+        # du pool engendre N nouveaux processus Python (~5-10 s chacun). Recréer
+        # le pool à chaque lot de 200 communes coûtait N×nb_lots spawns inutiles.
         with ProcessPoolExecutor(max_workers=workers) as exe:
-            futs = {
-                exe.submit(_compute_commune_pairs_worker, code, data): code
-                for code, data in tasks
-            }
-            with tqdm(total=len(futs), desc="Adjacence parcelles", unit="commune") as pbar:
-                for fut in as_completed(futs):
-                    code = futs[fut]
-                    try:
-                        pairs = fut.result()
-                    except Exception as e:
-                        logger.error(f"[parcel_adj] {code} ÉCHEC : {e}")
+            with tqdm(total=len(todo), desc="Adjacence parcelles", unit="commune") as pbar:
+                for batch_start in range(0, len(todo), _COMPUTE_BATCH):
+                    batch_codes = todo[batch_start : batch_start + _COMPUTE_BATCH]
+
+                    # Charge uniquement ce lot en WKB binaire (50 % plus compact que GeoJSON,
+                    # parsing ~5× plus rapide dans les workers)
+                    commune_data = _load_commune_geometries_wkb(con, batch_codes)
+
+                    tasks = [
+                        (code, commune_data.get(code, []))
+                        for code in batch_codes
+                        if len(commune_data.get(code, [])) >= 2
+                    ]
+
+                    futs = {
+                        exe.submit(_compute_commune_pairs_worker, code, data): code
+                        for code, data in tasks
+                    }
+                    for fut in as_completed(futs):
+                        code = futs[fut]
+                        try:
+                            pairs = fut.result()
+                        except Exception as e:
+                            logger.error(f"[parcel_adj] {code} ÉCHEC : {e}")
+                            pbar.update(1)
+                            continue
+
+                        if pairs:
+                            _bulk_insert(con, pairs)
+                            total_pairs += len(pairs)
+                        completed += 1
                         pbar.update(1)
-                        continue
+                        pbar.set_postfix(pairs=f"{total_pairs:,}")
 
-                    if pairs:
-                        _bulk_insert(write_con, pairs)
-                        total_pairs += len(pairs)
-                    completed += 1
-                    pbar.update(1)
-                    pbar.set_postfix(pairs=f"{total_pairs:,}")
+                        if completed % _CHECKPOINT_EVERY == 0:
+                            con.execute("CHECKPOINT")
 
-                    if completed % _CHECKPOINT_EVERY == 0:
-                        write_con.execute("CHECKPOINT")
+                    del commune_data  # libère la mémoire du lot avant le suivant
+                    con.execute("CHECKPOINT")
 
-        write_con.execute("CHECKPOINT")
         logger.info(f"[parcel_adj] Terminé : {total_pairs:,} paires sur {completed} communes.")
     finally:
-        write_con.close()
+        con.close()
 
 
 # ---------------------------------------------------------------------------
-# Helpers SQL (main thread)
+# Helpers SQL
 # ---------------------------------------------------------------------------
 
 def _ensure_table(con: duckdb.DuckDBPyConnection) -> None:
@@ -169,30 +169,25 @@ def _list_target_communes(
     return [r[0] for r in rows]
 
 
-def _load_commune_geometries(
+def _load_commune_geometries_wkb(
     con: duckdb.DuckDBPyConnection,
-    todo: list[str],
-) -> dict[str, list[tuple[str, str]]]:
-    """Charge id + GeoJSON de toutes les parcelles des communes cibles, par lots."""
-    commune_data: dict[str, list[tuple[str, str]]] = {}
-    total = len(todo)
+    batch: list[str],
+) -> dict[str, list[tuple[str, bytes]]]:
+    """Charge id + WKB binaire pour les communes du lot, par sous-requêtes SQL."""
+    commune_data: dict[str, list[tuple[str, bytes]]] = {}
 
-    with tqdm(total=total, desc="Chargement géométries", unit="commune") as pbar:
-        for start in range(0, total, _LOAD_BATCH):
-            batch = todo[start : start + _LOAD_BATCH]
-            placeholders = ", ".join("?" * len(batch))
-            rows = con.execute(
-                f"SELECT code_insee, id, ST_AsGeoJSON(geometry) "
-                f"FROM parcelles WHERE code_insee IN ({placeholders})",
-                batch,
-            ).fetchall()
-            for code_insee, pid, geojson in rows:
-                if geojson:
-                    commune_data.setdefault(code_insee, []).append((pid, geojson))
-            pbar.update(len(batch))
+    for start in range(0, len(batch), _LOAD_BATCH):
+        sub = batch[start : start + _LOAD_BATCH]
+        placeholders = ", ".join("?" * len(sub))
+        rows = con.execute(
+            f"SELECT code_insee, id, ST_AsWKB(geometry) "
+            f"FROM parcelles WHERE code_insee IN ({placeholders})",
+            sub,
+        ).fetchall()
+        for code_insee, pid, wkb_bytes in rows:
+            if wkb_bytes:
+                commune_data.setdefault(code_insee, []).append((pid, bytes(wkb_bytes)))
 
-    parcel_count = sum(len(v) for v in commune_data.values())
-    logger.info(f"[parcel_adj] {parcel_count:,} parcelles chargées pour {len(commune_data)} communes.")
     return commune_data
 
 
@@ -231,17 +226,17 @@ def _bulk_insert(con: duckdb.DuckDBPyConnection, pairs: list[tuple[str, str]]) -
 
 def _compute_commune_pairs_worker(
     code_insee: str,
-    rows: list[tuple[str, str]],
+    rows: list[tuple[str, bytes]],
 ) -> list[tuple[str, str]]:
-    """Calcule les paires adjacentes depuis des données pré-chargées (sans DuckDB)."""
+    """Calcule les paires adjacentes depuis des données WKB pré-chargées."""
     if len(rows) < 2:
         return []
 
     ids: list[str] = []
     geoms = []
-    for pid, geojson in rows:
+    for pid, wkb_bytes in rows:
         try:
-            geoms.append(shape(json.loads(geojson)))
+            geoms.append(wkb_loads(wkb_bytes))
             ids.append(pid)
         except Exception:
             continue
@@ -254,12 +249,11 @@ def _compute_commune_pairs_worker(
     pairs: set[tuple[str, str]] = set()
 
     for i, buf in enumerate(buffered):
-        for j in tree.query(buf):
+        for j in tree.query(buf, predicate="intersects"):
             if j <= i:
                 continue
-            if buf.intersects(buffered[j]) and not geoms[i].equals(geoms[j]):
-                a, b = ids[i], ids[j]
-                pairs.add((a, b) if a < b else (b, a))
+            a, b = ids[i], ids[j]
+            pairs.add((a, b) if a < b else (b, a))
 
     return list(pairs)
 
