@@ -14,19 +14,24 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import duckdb
+import numpy as np
 from loguru import logger
+from shapely import simplify
 from shapely.strtree import STRtree
 from shapely.wkb import loads as wkb_loads
 from tqdm import tqdm
 
 from cadastre_finder.config import DB_PATH
 
-_CHECKPOINT_EVERY = 50
+_CHECKPOINT_EVERY = 1000
 _BATCH_INSERT = 50_000
 _LOAD_BATCH = 500       # communes chargées par requête SQL (évite un IN() trop long)
 _COMPUTE_BATCH = 200    # communes traitées par lot (contrôle l'empreinte mémoire)
 # Buffer en degrés WGS84 pour combler les micro-gaps cadastraux (~1 m à 47°N)
 _BUFFER_DEG = 0.000009
+# Tolérance de simplification Douglas-Peucker (~11 cm en WGS84) — sans impact
+# sémantique pour de l'adjacence à 1 m, élimine 70-90 % des sommets de bruit.
+_SIMPLIFY_TOL = 1e-6
 
 
 def build_parcel_adjacency(
@@ -75,49 +80,64 @@ def build_parcel_adjacency(
         total_pairs = 0
         completed = 0
 
-        # Le pool est créé UNE SEULE FOIS : sur Windows (spawn), chaque création
-        # du pool engendre N nouveaux processus Python (~5-10 s chacun). Recréer
-        # le pool à chaque lot de 200 communes coûtait N×nb_lots spawns inutiles.
-        with ProcessPoolExecutor(max_workers=workers) as exe:
-            with tqdm(total=len(todo), desc="Adjacence parcelles", unit="commune") as pbar:
-                for batch_start in range(0, len(todo), _COMPUTE_BATCH):
-                    batch_codes = todo[batch_start : batch_start + _COMPUTE_BATCH]
+        # Drop des index secondaires APRÈS _list_already_done (qui en bénéficie).
+        # Maintenir 2 index sur des millions de lignes pendant 6000 communes coûte
+        # bien plus cher que de les reconstruire en bloc à la fin.
+        logger.info("[parcel_adj] Drop des index (recréation in-fine)")
+        con.execute("DROP INDEX IF EXISTS idx_parcel_adj_a")
+        con.execute("DROP INDEX IF EXISTS idx_parcel_adj_b")
 
-                    # Charge uniquement ce lot en WKB binaire (50 % plus compact que GeoJSON,
-                    # parsing ~5× plus rapide dans les workers)
-                    commune_data = _load_commune_geometries_wkb(con, batch_codes)
+        try:
+            # Le pool est créé UNE SEULE FOIS : sur Windows (spawn), chaque création
+            # du pool engendre N nouveaux processus Python (~5-10 s chacun). Recréer
+            # le pool à chaque lot de 200 communes coûtait N×nb_lots spawns inutiles.
+            with ProcessPoolExecutor(max_workers=workers) as exe:
+                with tqdm(total=len(todo), desc="Adjacence parcelles", unit="commune") as pbar:
+                    for batch_start in range(0, len(todo), _COMPUTE_BATCH):
+                        batch_codes = todo[batch_start : batch_start + _COMPUTE_BATCH]
 
-                    tasks = [
-                        (code, commune_data.get(code, []))
-                        for code in batch_codes
-                        if len(commune_data.get(code, [])) >= 2
-                    ]
+                        # Charge uniquement ce lot en WKB binaire (50 % plus compact que GeoJSON,
+                        # parsing ~5× plus rapide dans les workers)
+                        commune_data = _load_commune_geometries_wkb(con, batch_codes)
 
-                    futs = {
-                        exe.submit(_compute_commune_pairs_worker, code, data): code
-                        for code, data in tasks
-                    }
-                    for fut in as_completed(futs):
-                        code = futs[fut]
-                        try:
-                            pairs = fut.result()
-                        except Exception as e:
-                            logger.error(f"[parcel_adj] {code} ÉCHEC : {e}")
+                        tasks = [
+                            (code, commune_data.get(code, []))
+                            for code in batch_codes
+                            if len(commune_data.get(code, [])) >= 2
+                        ]
+
+                        futs = {
+                            exe.submit(_compute_commune_pairs_worker, code, data): code
+                            for code, data in tasks
+                        }
+                        for fut in as_completed(futs):
+                            code = futs[fut]
+                            try:
+                                pairs = fut.result()
+                            except Exception as e:
+                                logger.error(f"[parcel_adj] {code} ÉCHEC : {e}")
+                                pbar.update(1)
+                                continue
+
+                            if pairs:
+                                _bulk_insert(con, pairs)
+                                total_pairs += len(pairs)
+                            completed += 1
                             pbar.update(1)
-                            continue
+                            pbar.set_postfix(pairs=f"{total_pairs:,}")
 
-                        if pairs:
-                            _bulk_insert(con, pairs)
-                            total_pairs += len(pairs)
-                        completed += 1
-                        pbar.update(1)
-                        pbar.set_postfix(pairs=f"{total_pairs:,}")
+                            # CHECKPOINT espacé : sur une table qui grossit, chaque
+                            # checkpoint flush tout le WAL → coût croissant. Cause
+                            # principale du ralentissement progressif observé.
+                            if completed % _CHECKPOINT_EVERY == 0:
+                                con.execute("CHECKPOINT")
 
-                        if completed % _CHECKPOINT_EVERY == 0:
-                            con.execute("CHECKPOINT")
-
-                    del commune_data  # libère la mémoire du lot avant le suivant
-                    con.execute("CHECKPOINT")
+                        del commune_data  # libère la mémoire du lot avant le suivant
+        finally:
+            logger.info("[parcel_adj] Reconstruction des index secondaires")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_parcel_adj_a ON parcelles_adjacency (id_a)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_parcel_adj_b ON parcelles_adjacency (id_b)")
+            con.execute("CHECKPOINT")
 
         logger.info(f"[parcel_adj] Terminé : {total_pairs:,} paires sur {completed} communes.")
     finally:
@@ -129,11 +149,45 @@ def build_parcel_adjacency(
 # ---------------------------------------------------------------------------
 
 def _ensure_table(con: duckdb.DuckDBPyConnection) -> None:
+    # Migration une fois : retire la PRIMARY KEY (id_a, id_b) si elle est encore
+    # présente. La PK est redondante (paires uniques par construction) et coûte
+    # très cher à maintenir à chaque INSERT sur une table de plusieurs millions
+    # de lignes. DuckDB 1.x ne supporte pas ALTER TABLE DROP CONSTRAINT → on
+    # passe par CREATE TABLE AS SELECT + DROP + RENAME.
+    has_table = con.execute(
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_name = 'parcelles_adjacency'"
+    ).fetchone()[0] > 0
+
+    if has_table:
+        has_pk = con.execute("""
+            SELECT COUNT(*) FROM information_schema.table_constraints
+            WHERE table_name = 'parcelles_adjacency'
+              AND constraint_type = 'PRIMARY KEY'
+        """).fetchone()[0] > 0
+
+        if has_pk:
+            n_before = con.execute("SELECT COUNT(*) FROM parcelles_adjacency").fetchone()[0]
+            logger.info(
+                f"[parcel_adj] Migration : suppression de la PRIMARY KEY "
+                f"({n_before:,} paires à préserver)"
+            )
+            con.execute("DROP TABLE IF EXISTS _padj_new")
+            con.execute("CREATE TABLE _padj_new AS SELECT id_a, id_b FROM parcelles_adjacency")
+            n_after = con.execute("SELECT COUNT(*) FROM _padj_new").fetchone()[0]
+            if n_after != n_before:
+                con.execute("DROP TABLE _padj_new")
+                raise RuntimeError(
+                    f"[parcel_adj] Migration KO : {n_before:,} → {n_after:,} lignes"
+                )
+            con.execute("DROP TABLE parcelles_adjacency")
+            con.execute("ALTER TABLE _padj_new RENAME TO parcelles_adjacency")
+            logger.info("[parcel_adj] Migration OK")
+
     con.execute("""
         CREATE TABLE IF NOT EXISTS parcelles_adjacency (
             id_a VARCHAR NOT NULL,
-            id_b VARCHAR NOT NULL,
-            PRIMARY KEY (id_a, id_b)
+            id_b VARCHAR NOT NULL
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_parcel_adj_a ON parcelles_adjacency (id_a)")
@@ -215,9 +269,12 @@ def _delete_existing(con: duckdb.DuckDBPyConnection, codes: list[str]) -> None:
 def _bulk_insert(con: duckdb.DuckDBPyConnection, pairs: list[tuple[str, str]]) -> None:
     if not pairs:
         return
+    # Sans PRIMARY KEY ni index pendant l'ingest, INSERT brut est ~10× plus
+    # rapide que INSERT OR IGNORE. Les paires sont uniques par construction
+    # (set par worker + parcelle mono-commune + _delete_existing si --force).
     for start in range(0, len(pairs), _BATCH_INSERT):
         batch = pairs[start : start + _BATCH_INSERT]
-        con.executemany("INSERT OR IGNORE INTO parcelles_adjacency VALUES (?, ?)", batch)
+        con.executemany("INSERT INTO parcelles_adjacency VALUES (?, ?)", batch)
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +293,11 @@ def _compute_commune_pairs_worker(
     geoms = []
     for pid, wkb_bytes in rows:
         try:
-            geoms.append(wkb_loads(wkb_bytes))
+            g = wkb_loads(wkb_bytes)
+            # Élimine 70-90 % des sommets (bruit numérique sub-millimétrique
+            # du cadastre) — sans impact pour de l'adjacence à 1 m.
+            g = simplify(g, _SIMPLIFY_TOL, preserve_topology=False)
+            geoms.append(g)
             ids.append(pid)
         except Exception:
             continue
@@ -244,16 +305,19 @@ def _compute_commune_pairs_worker(
     if len(geoms) < 2:
         return []
 
-    buffered = [g.buffer(_BUFFER_DEG) for g in geoms]
-    tree = STRtree(buffered)
-    pairs: set[tuple[str, str]] = set()
+    # `dwithin` calcule la distance directement au niveau GEOS sans matérialiser
+    # de polygones tampons (coûteux sur des polygones complexes). La requête
+    # vectorisée retourne toutes les paires intersectantes en un seul appel C.
+    geoms_arr = np.asarray(geoms, dtype=object)
+    tree = STRtree(geoms_arr)
+    qi_arr, ti_arr = tree.query(geoms_arr, predicate="dwithin", distance=_BUFFER_DEG)
 
-    for i, buf in enumerate(buffered):
-        for j in tree.query(buf, predicate="intersects"):
-            if j <= i:
-                continue
-            a, b = ids[i], ids[j]
-            pairs.add((a, b) if a < b else (b, a))
+    pairs: set[tuple[str, str]] = set()
+    for qi, ti in zip(qi_arr, ti_arr):
+        if qi >= ti:
+            continue
+        a, b = ids[qi], ids[ti]
+        pairs.add((a, b) if a < b else (b, a))
 
     return list(pairs)
 
