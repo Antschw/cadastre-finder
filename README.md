@@ -32,6 +32,11 @@ uv pip install -e ".[dev]"
 sudo dnf install osmium-tool  # Fedora
 # ou
 sudo apt install osmium-tool # Ubuntu/Debian
+# ou (Windows)
+# Recommandé (via Conda/Mamba) : conda install -c conda-forge osmium-tool
+# Alternative (via vcpkg) : vcpkg install osmium-tool
+# Note : osmium-tool n'est pas disponible sur Chocolatey ou Scoop.
+# Option C : Utiliser WSL (Windows Subsystem for Linux)
 ```
 
 ---
@@ -41,7 +46,8 @@ sudo apt install osmium-tool # Ubuntu/Debian
 ### Méthode recommandée : commande unique
 
 `build-database` enchaîne automatiquement, en une seule commande, toutes les étapes
-nécessaires à la construction d'une base complète et cohérente :
+nécessaires à la construction d'une base complète et cohérente. **Elle initialise
+automatiquement la base DuckDB (`data/processed/cadastre.duckdb`) si elle n'existe pas.**
 
 1. Téléchargement parallèle des fichiers cadastre Etalab pour les 20 départements.
 2. Téléchargement automatique des PBF régionaux Geofabrik (Bretagne, Normandie,

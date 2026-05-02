@@ -2,15 +2,25 @@
 
 Les communes voisines (rang 1) sont celles dont les géométries se touchent
 ou se croisent (avec un buffer de 1m pour absorber les imprécisions topologiques).
+
+Approche : Python + Shapely STRtree (même pattern que parcel_adjacency.py).
+La jointure SQL cartésienne O(N²) sans index spatial était trop lente (~1-3h pour 7 600 communes).
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import duckdb
 from loguru import logger
+from shapely.geometry import shape
+from shapely.strtree import STRtree
+from tqdm import tqdm
 
 from cadastre_finder.config import DB_PATH
+
+_BUFFER_DEG = 0.00001   # ≈ 1 m à la latitude de la France
+_BATCH_INSERT = 10_000  # paires par executemany
 
 
 def build_adjacency_table(
@@ -32,7 +42,7 @@ def build_adjacency_table(
         if count == 0:
             raise RuntimeError("La table communes est vide. Lancez d'abord l'ingestion cadastre.")
 
-        # Vérification idempotence
+        # Idempotence : skip si déjà construit
         existing = con.execute(
             "SELECT COUNT(*) FROM information_schema.tables "
             "WHERE table_name = 'communes_adjacency'"
@@ -45,66 +55,92 @@ def build_adjacency_table(
                 logger.info(f"Table d'adjacence déjà construite ({n} paires rang 1). Skip.")
                 return
 
-        logger.info("Construction de la table d'adjacence (rang 1)...")
+        # --- Chargement des géométries ---
+        logger.info(f"Chargement de {count} communes depuis DuckDB...")
+        rows = con.execute(
+            "SELECT code_insee, ST_AsGeoJSON(geometry) FROM communes ORDER BY code_insee"
+        ).fetchall()
 
-        # Calcul des adjacences rang 1
-        # Buffer de 1m en EPSG:4326 ≈ 9e-6 degrés, suffisant pour les imprécisions
-        # On utilise ST_Intersects avec un tiny buffer pour gérer les touches exactes
-        con.execute("""
-            CREATE OR REPLACE TABLE communes_adjacency AS
-            SELECT DISTINCT
-                a.code_insee AS code_insee_a,
-                b.code_insee AS code_insee_b,
-                1            AS rang
-            FROM communes a
-            JOIN communes b ON (
-                a.code_insee < b.code_insee
-                AND ST_Intersects(
-                    ST_Buffer(a.geometry, 0.00001),
-                    ST_Buffer(b.geometry, 0.00001)
-                )
-                AND NOT ST_Equals(a.geometry, b.geometry)
-            )
-        """)
+        codes: list[str] = []
+        geoms = []
+        for code, geojson in rows:
+            if not geojson:
+                continue
+            codes.append(code)
+            geoms.append(shape(json.loads(geojson)))
 
-        # Symétrisation : ajouter les paires inverses
-        con.execute("""
-            INSERT INTO communes_adjacency (code_insee_a, code_insee_b, rang)
-            SELECT code_insee_b, code_insee_a, 1
-            FROM communes_adjacency
-            WHERE rang = 1
-        """)
+        n_communes = len(codes)
+        logger.info(f"{n_communes} communes chargées.")
 
-        n1 = con.execute(
-            "SELECT COUNT(*) FROM communes_adjacency WHERE rang = 1"
-        ).fetchone()[0]
-        logger.info(f"Rang 1 : {n1} paires d'adjacence calculées.")
+        # --- Bufferisation unique ---
+        logger.info("Bufferisation des géométries (une fois par commune)...")
+        buffered = [g.buffer(_BUFFER_DEG) for g in tqdm(geoms, desc="Buffer", unit="commune", leave=False)]
 
+        # --- STRtree ---
+        logger.info("Construction du STRtree spatial...")
+        tree = STRtree(buffered)
+
+        # --- Rang 1 ---
+        logger.info(f"Calcul rang 1 sur {n_communes} communes...")
+        pairs_rang1: set[tuple[str, str]] = set()
+
+        for i in tqdm(range(n_communes), desc="Rang 1 — voisins directs", unit="commune"):
+            buf_i = buffered[i]
+            for j in tree.query(buf_i):
+                if j <= i:
+                    continue
+                if geoms[i].equals(geoms[j]):
+                    continue
+                if buf_i.intersects(buffered[j]):
+                    pairs_rang1.add((codes[i], codes[j]))
+
+        n1 = len(pairs_rang1)
+        logger.info(f"Rang 1 : {n1} paires trouvées. Insertion en base (+ symétrique)...")
+
+        _ensure_table(con)
+        _batch_insert(con, list(pairs_rang1), rang=1)
+        _batch_insert(con, [(b, a) for a, b in pairs_rang1], rang=1)
+
+        n1_db = con.execute("SELECT COUNT(*) FROM communes_adjacency WHERE rang = 1").fetchone()[0]
+        logger.info(f"Rang 1 : {n1_db} paires insérées (symétrisées).")
+
+        # --- Rang 2 ---
         if include_rank2:
-            logger.info("Calcul du rang 2...")
-            con.execute("""
-                INSERT INTO communes_adjacency (code_insee_a, code_insee_b, rang)
-                SELECT DISTINCT
-                    r1.code_insee_a,
-                    r1b.code_insee_b,
-                    2 AS rang
-                FROM communes_adjacency r1
-                JOIN communes_adjacency r1b ON r1.code_insee_b = r1b.code_insee_a
-                WHERE r1b.code_insee_b != r1.code_insee_a
-                  AND r1.rang = 1
-                  AND r1b.rang = 1
-                  AND NOT EXISTS (
-                      SELECT 1 FROM communes_adjacency ex
-                      WHERE ex.code_insee_a = r1.code_insee_a
-                        AND ex.code_insee_b = r1b.code_insee_b
-                  )
-            """)
-            n2 = con.execute(
-                "SELECT COUNT(*) FROM communes_adjacency WHERE rang = 2"
-            ).fetchone()[0]
-            logger.info(f"Rang 2 : {n2} paires supplémentaires calculées.")
+            logger.info("Calcul rang 2 (voisins des voisins)...")
 
-        # Index sur code_insee_a pour les lookups rapides
+            # Graphe d'adjacence rang 1 (symétrique)
+            adj: dict[str, set[str]] = {}
+            for a, b in pairs_rang1:
+                adj.setdefault(a, set()).add(b)
+                adj.setdefault(b, set()).add(a)
+
+            # Ensemble de toutes les paires rang 1 (dans les deux sens)
+            rang1_set: set[tuple[str, str]] = set()
+            for a, b in pairs_rang1:
+                rang1_set.add((a, b))
+                rang1_set.add((b, a))
+
+            pairs_rang2: set[tuple[str, str]] = set()
+            for code_a in tqdm(adj, desc="Rang 2 — voisins des voisins", unit="commune"):
+                for code_mid in adj[code_a]:
+                    for code_b in adj[code_mid]:
+                        if code_b == code_a:
+                            continue
+                        if (code_a, code_b) in rang1_set:
+                            continue
+                        # Stockage canonique pour éviter les doublons
+                        pairs_rang2.add((min(code_a, code_b), max(code_a, code_b)))
+
+            n2 = len(pairs_rang2)
+            logger.info(f"Rang 2 : {n2} paires trouvées. Insertion en base (+ symétrique)...")
+            _batch_insert(con, list(pairs_rang2), rang=2)
+            _batch_insert(con, [(b, a) for a, b in pairs_rang2], rang=2)
+
+            n2_db = con.execute("SELECT COUNT(*) FROM communes_adjacency WHERE rang = 2").fetchone()[0]
+            logger.info(f"Rang 2 : {n2_db} paires insérées (symétrisées).")
+
+        # --- Index ---
+        logger.info("Création des index...")
         con.execute("""
             CREATE INDEX IF NOT EXISTS idx_communes_adj_a
             ON communes_adjacency (code_insee_a)
@@ -113,10 +149,37 @@ def build_adjacency_table(
             CREATE INDEX IF NOT EXISTS idx_communes_adj_a_rang
             ON communes_adjacency (code_insee_a, rang)
         """)
-
+        con.execute("CHECKPOINT")
         logger.info("Table d'adjacence construite avec succès.")
+
     finally:
         con.close()
+
+
+def _ensure_table(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS communes_adjacency (
+            code_insee_a VARCHAR,
+            code_insee_b VARCHAR,
+            rang         INTEGER
+        )
+    """)
+
+
+def _batch_insert(
+    con: duckdb.DuckDBPyConnection,
+    pairs: list[tuple[str, str]],
+    rang: int,
+) -> None:
+    if not pairs:
+        return
+    data = [(a, b, rang) for a, b in pairs]
+    for start in range(0, len(data), _BATCH_INSERT):
+        chunk = data[start : start + _BATCH_INSERT]
+        con.executemany(
+            "INSERT INTO communes_adjacency (code_insee_a, code_insee_b, rang) VALUES (?, ?, ?)",
+            chunk,
+        )
 
 
 def get_neighbors(

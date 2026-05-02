@@ -3,13 +3,14 @@ from cadastre_finder.config import DEPARTMENTS, MIN_TERRAIN_M2, CRS_LAMBERT93, C
 
 
 def test_departments_count():
-    assert len(DEPARTMENTS) == 20
+    assert len(DEPARTMENTS) == 21
 
 
 def test_departments_include_key_depts():
     assert "61" in DEPARTMENTS  # Orne
     assert "76" in DEPARTMENTS  # Seine-Maritime
     assert "86" in DEPARTMENTS  # Vienne
+    assert "60" in DEPARTMENTS  # Oise
 
 
 def test_min_surface():

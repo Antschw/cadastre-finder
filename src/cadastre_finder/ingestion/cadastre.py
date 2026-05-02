@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import gzip
 import json
-import shutil
-import tempfile
 from pathlib import Path
 
 import duckdb
@@ -15,7 +13,12 @@ import httpx
 from loguru import logger
 from tqdm import tqdm
 
-from cadastre_finder.config import CADASTRE_BASE_URL, DATA_RAW, DB_PATH
+from cadastre_finder.config import (
+    CADASTRE_BASE_URL,
+    DB_PATH,
+    RAW_CADASTRE_COMMUNES_DIR,
+    RAW_CADASTRE_PARCELLES_DIR,
+)
 
 
 def _cadastre_url(dept: str, kind: str) -> str:
@@ -27,25 +30,34 @@ def _cadastre_url(dept: str, kind: str) -> str:
     )
 
 
-def download_department(dept_code: str, raw_dir: Path = DATA_RAW) -> dict[str, Path]:
+def _cadastre_path(dept: str, kind: str) -> Path:
+    """Retourne le chemin local attendu pour un fichier cadastre."""
+    if kind == "communes":
+        return RAW_CADASTRE_COMMUNES_DIR / f"cadastre-{dept}-communes.json.gz"
+    if kind == "parcelles":
+        return RAW_CADASTRE_PARCELLES_DIR / f"cadastre-{dept}-parcelles.json.gz"
+    raise ValueError(f"Type de fichier cadastre inconnu : {kind}")
+
+
+def download_department(dept_code: str) -> dict[str, Path]:
     """Télécharge les fichiers GeoJSON cadastre (parcelles + communes) pour un département.
 
     Returns:
         dict avec les clés 'parcelles' et 'communes' pointant vers les fichiers locaux.
     """
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    RAW_CADASTRE_COMMUNES_DIR.mkdir(parents=True, exist_ok=True)
+    RAW_CADASTRE_PARCELLES_DIR.mkdir(parents=True, exist_ok=True)
     dept = dept_code.zfill(2)
-    files = {}
+    files: dict[str, Path] = {}
 
     for kind in ("parcelles", "communes"):
-        url = _cadastre_url(dept, kind)
-        dest = raw_dir / f"cadastre-{dept}-{kind}.json.gz"
+        dest = _cadastre_path(dept, kind)
 
         if dest.exists():
-            logger.info(f"[{dept}] {kind} déjà téléchargé : {dest}")
             files[kind] = dest
             continue
 
+        url = _cadastre_url(dept, kind)
         logger.info(f"[{dept}] Téléchargement {kind} depuis {url}")
         tmp = dest.with_suffix(".tmp")
         try:
@@ -78,7 +90,6 @@ def _load_geojson_gz(path: Path) -> dict:
 def load_department_to_duckdb(
     dept_code: str,
     db_path: Path = DB_PATH,
-    raw_dir: Path = DATA_RAW,
 ) -> None:
     """Télécharge (si nécessaire) et charge les données d'un département dans DuckDB.
 
@@ -89,7 +100,7 @@ def load_department_to_duckdb(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     dept = dept_code.zfill(2)
 
-    files = download_department(dept, raw_dir)
+    files = download_department(dept)
 
     con = duckdb.connect(str(db_path))
     try:
@@ -158,7 +169,7 @@ def _load_parcelles(
     features = data.get("features", [])
 
     rows = []
-    for feat in tqdm(features, desc=f"{dept}-parcelles", leave=False):
+    for feat in features:
         props = feat.get("properties", {})
         geom = feat.get("geometry")
         geom_wkt = _geom_to_wkt(geom)
@@ -188,7 +199,7 @@ def _load_parcelles(
         FROM _staging_parcelles
     """)
     con.unregister("_staging_parcelles")
-    logger.info(f"[{dept}] {len(rows)} parcelles insérées.")
+    # Log plus discret supprimé ici car build_all gère maintenant le log par département
 
 
 def _load_communes(
@@ -226,7 +237,7 @@ def _load_communes(
         FROM _staging_communes
     """)
     con.unregister("_staging_communes")
-    logger.info(f"[{dept}] {len(rows)} communes insérées.")
+    # Log plus discret supprimé ici car build_all gère maintenant le log par département
 
 
 def _geom_to_wkt(geom: dict | None) -> str | None:

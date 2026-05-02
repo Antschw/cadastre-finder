@@ -49,7 +49,7 @@ def search_dpe(
                 surface_habitable_logement, etiquette_dpe, etiquette_ges,
                 date_établissement_dpe
             FROM {DPE_TABLE}
-            WHERE code_insee_commune_actualisé = ?
+            WHERE code_insee_ban = ?
               AND surface_habitable_logement BETWEEN ? AND ?
         """
         params = [code_insee, surf_min, surf_max]

@@ -1,19 +1,18 @@
 """Orchestrateur d'ingestion globale.
 
 Une seule commande pour construire l'intégralité de la base de données :
-    1. Téléchargement automatique des PBF régionaux Geofabrik (couverture des 20 départements)
-    2. Fusion + extraction d'un PBF régional via `osmium merge` / `osmium extract`
-    3. Ingestion cadastre Etalab pour les 20 départements (téléchargements parallèles)
+    1. Vérification des PBF régionaux Geofabrik (téléchargement uniquement de ce qui manque)
+    2. Fusion + extraction d'un PBF couvrant les 21 départements via `osmium merge` / `osmium extract`
+    3. Ingestion cadastre Etalab pour les 21 départements
     4. Ingestion OSM (POI, routes, hydrographie, bâtiments)
     5. Ingestion DPE ADEME
     6. Pré-calculs : adjacence des communes + adjacence des parcelles
 
 Caractéristiques :
-    - Heartbeat (un log toutes les 60 secondes, jamais > 5 min de silence)
     - Optimisations DuckDB : threads=N_CPU, memory_limit configurable,
       temp_directory sur le volume de la DB (NVMe).
     - Idempotence : reprise sans recommencer ce qui est déjà fait.
-    - Logs structurés avec ETA et bilan final.
+    - Progression visible via `tqdm` aux étapes longues.
 
 Usage :
     python -m cadastre_finder.cli build-database
@@ -24,10 +23,8 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -35,11 +32,14 @@ from typing import Iterable
 import duckdb
 import httpx
 from loguru import logger
+from tqdm import tqdm
 
 from cadastre_finder.config import (
-    DATA_RAW,
     DB_PATH,
     DEPARTMENTS,
+    RAW_CADASTRE_COMMUNES_DIR,
+    RAW_CADASTRE_PARCELLES_DIR,
+    RAW_OSM_DIR,
 )
 from cadastre_finder.ingestion.cadastre import (
     download_department,
@@ -51,130 +51,45 @@ from cadastre_finder.ingestion.cadastre import (
 # Configuration
 # ---------------------------------------------------------------------------
 
-# 5 régions Geofabrik qui couvrent les 20 départements du périmètre
+# Anciennes régions administratives (les fichiers Geofabrik existent toujours sous ces noms)
+# qui couvrent les 21 départements du périmètre.
 GEOFABRIK_BASE = "https://download.geofabrik.de/europe/france"
 GEOFABRIK_REGIONS = (
-    "bretagne",
-    "normandie",
-    "pays-de-la-loire",
-    "centre-val-de-loire",
-    "nouvelle-aquitaine",  # large, contient 79 et 86
+    "bretagne",          # 22, 29, 35, 56
+    "basse-normandie",   # 14, 50, 61
+    "haute-normandie",   # 27, 76
+    "pays-de-la-loire",  # 44, 49, 53, 72, 85
+    "centre",            # 28, 37, 41, 45
+    "poitou-charentes",  # 79, 86
+    "picardie",          # 60 (Oise uniquement)
 )
 
-# Bounding box englobant les 20 départements (lon_min,lat_min,lon_max,lat_max)
-PERIMETER_BBOX = "-5.20,46.00,2.80,50.10"
+# Bounding box englobant les 21 départements (lon_min,lat_min,lon_max,lat_max)
+# Étendue à l'est pour inclure la Picardie/Oise (~3.2°E max)
+PERIMETER_BBOX = "-5.20,46.00,3.30,50.10"
 
-# Téléchargements cadastre en parallèle (I/O bound).
-# 8 connexions concurrentes saturent un débit consommateur sans surcharger les serveurs Etalab.
+# Téléchargements cadastre en parallèle (I/O bound, filet de sécurité uniquement).
 CADASTRE_DOWNLOAD_WORKERS = 8
 
-# Heartbeat : un message au moins toutes les 60 secondes
-HEARTBEAT_INTERVAL_S = 60
 
-# Optimisations DuckDB :
-#   - Threads = nombre de cœurs logiques (Ryzen 9 7950X3D = 32)
-#   - memory_limit ~ 75 % de la RAM disponible (32 Go DDR5 → 24 Go)
-#   - temp_directory sur le volume DB (NVMe Gen5 → I/O massif)
 def _default_threads() -> int:
     return os.cpu_count() or 8
 
 
 # ---------------------------------------------------------------------------
-# Heartbeat — thread qui garantit un log régulier
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _StageState:
-    """État partagé entre le thread principal et le heartbeat."""
-    stage: str = "init"
-    started_at: float = field(default_factory=time.monotonic)
-    detail: str = ""
-    finished: bool = False
-
-
-class HeartbeatLogger:
-    """Émet périodiquement un log « still alive » pendant les phases longues.
-
-    Usage :
-        hb = HeartbeatLogger(interval=60)
-        with hb.stage("Téléchargement PBF", "Geofabrik"):
-            ...long task...
-    """
-
-    def __init__(self, interval: float = HEARTBEAT_INTERVAL_S) -> None:
-        self._interval = interval
-        self._state = _StageState()
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._loop, name="heartbeat", daemon=True
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-        self._thread = None
-
-    def _loop(self) -> None:
-        while not self._stop.wait(self._interval):
-            with self._lock:
-                if self._state.finished:
-                    continue
-                stage = self._state.stage
-                detail = self._state.detail
-                elapsed = time.monotonic() - self._state.started_at
-            mins, secs = divmod(int(elapsed), 60)
-            logger.info(
-                f"[heartbeat] Étape « {stage} » en cours depuis {mins}m{secs:02d}s"
-                + (f" — {detail}" if detail else "")
-            )
-
-    @contextmanager
-    def stage(self, name: str, detail: str = ""):
-        with self._lock:
-            self._state = _StageState(stage=name, detail=detail)
-        try:
-            yield self
-        finally:
-            with self._lock:
-                self._state.finished = True
-
-    def update(self, detail: str) -> None:
-        """Mise à jour du libellé de détail (sans réinitialiser le chrono)."""
-        with self._lock:
-            self._state.detail = detail
-
-
-# ---------------------------------------------------------------------------
-# Téléchargement HTTP (resume + heartbeat)
+# Téléchargement HTTP avec reprise (utilisé uniquement si un fichier manque)
 # ---------------------------------------------------------------------------
 
 def _download_with_resume(
     url: str,
     dest: Path,
-    hb: HeartbeatLogger | None = None,
     chunk_size: int = 1 << 20,  # 1 MiB
 ) -> Path:
-    """Télécharge `url` vers `dest` avec reprise (HTTP Range) et heartbeat.
-
-    Idempotent : si `dest` existe déjà avec une taille cohérente, ne re-télécharge pas.
-    """
+    """Télécharge `url` vers `dest` avec reprise (HTTP Range)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
 
-    # Si dest existe déjà → on suppose terminé (Geofabrik n'expose pas de checksum simple,
-    # mais la cohérence sera vérifiée par osmium plus tard).
     if dest.exists() and dest.stat().st_size > 0:
-        size_mb = dest.stat().st_size / 1e6
-        logger.info(f"[download] Déjà présent : {dest.name} ({size_mb:.0f} Mo)")
         return dest
 
     resume_offset = tmp.stat().st_size if tmp.exists() else 0
@@ -184,25 +99,19 @@ def _download_with_resume(
         "GET", url, headers=headers, follow_redirects=True, timeout=600.0
     ) as r:
         r.raise_for_status()
-        # Total = ce qu'il reste à télécharger + ce qui est déjà présent
         remaining = int(r.headers.get("content-length", 0))
         total = remaining + resume_offset
         mode = "ab" if resume_offset else "wb"
         downloaded = resume_offset
-        last_log = time.monotonic()
 
-        with open(tmp, mode) as f:
+        with open(tmp, mode) as f, tqdm(
+            total=total, initial=downloaded, unit="B", unit_scale=True,
+            desc=dest.name, leave=False
+        ) as bar:
             for chunk in r.iter_bytes(chunk_size=chunk_size):
                 f.write(chunk)
                 downloaded += len(chunk)
-                now = time.monotonic()
-                if hb is not None and (now - last_log) >= 5:
-                    pct = (100 * downloaded / total) if total else 0
-                    hb.update(
-                        f"{dest.name} : {downloaded / 1e6:.0f} / {total / 1e6:.0f} Mo "
-                        f"({pct:.1f} %)"
-                    )
-                    last_log = now
+                bar.update(len(chunk))
 
     tmp.rename(dest)
     size_mb = dest.stat().st_size / 1e6
@@ -211,7 +120,7 @@ def _download_with_resume(
 
 
 # ---------------------------------------------------------------------------
-# Étape OSM : téléchargement Geofabrik + fusion + extraction
+# Étape OSM : validation des PBF régionaux + merge + extract
 # ---------------------------------------------------------------------------
 
 def _check_osmium() -> str:
@@ -224,135 +133,158 @@ def _check_osmium() -> str:
     )
 
 
+def _validate_pbf(path: Path, osmium_cmd: str) -> bool:
+    """Vérifie qu'un fichier PBF est lisible par osmium. Retourne False si corrompu."""
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    try:
+        r = subprocess.run(
+            [osmium_cmd, "fileinfo", str(path)],
+            capture_output=True, timeout=120
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def prepare_regional_pbf(
-    raw_dir: Path = DATA_RAW,
-    hb: HeartbeatLogger | None = None,
-    keep_intermediate: bool = False,
+    osm_dir: Path = RAW_OSM_DIR,
+    keep_intermediate: bool = True,
 ) -> Path:
-    """Télécharge les 5 régions Geofabrik et produit un PBF couvrant les 20 départements.
+    """Produit un PBF couvrant les 21 départements à partir des PBF régionaux.
 
     Stratégie :
-        1. Télécharge en parallèle les 5 .osm.pbf régionaux.
-        2. `osmium merge` → un seul PBF.
-        3. `osmium extract --bbox` → ne garde que la zone d'intérêt.
-        4. Supprime les intermédiaires (sauf si --keep-intermediate).
+        1. Valide les PBF régionaux déjà présents dans `osm_dir`.
+        2. Télécharge ce qui manque (filet de sécurité — l'utilisateur les a normalement déjà).
+        3. `osmium merge` → un seul PBF.
+        4. `osmium extract --bbox` → ne garde que la zone d'intérêt.
 
     Retourne le chemin du PBF régional final.
     """
     osmium = _check_osmium()
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    osm_dir.mkdir(parents=True, exist_ok=True)
 
-    final_pbf = raw_dir / "ouest-france.osm.pbf"
+    final_pbf = osm_dir / "ouest-france.osm.pbf"
     if final_pbf.exists():
-        size_mb = final_pbf.stat().st_size / 1e6
-        logger.info(f"[osm] PBF régional déjà présent : {final_pbf} ({size_mb:.0f} Mo)")
-        return final_pbf
+        if _validate_pbf(final_pbf, osmium):
+            size_mb = final_pbf.stat().st_size / 1e6
+            logger.info(f"[osm] PBF final déjà présent et valide : {final_pbf} ({size_mb:.0f} Mo)")
+            return final_pbf
+        logger.warning("[osm] PBF final corrompu, reconstruction...")
+        final_pbf.unlink()
 
-    # 1. Téléchargement parallèle (4 workers max, fichiers volumineux ⇒ I/O réseau)
-    hb_local = hb or HeartbeatLogger()
+    # 1. Vérification des PBF régionaux (l'utilisateur les a normalement déjà)
     region_files: list[Path] = []
-    with hb_local.stage("Téléchargement PBF régionaux Geofabrik"):
+    missing: list[str] = []
+    for region in GEOFABRIK_REGIONS:
+        path = osm_dir / f"{region}-latest.osm.pbf"
+        if _validate_pbf(path, osmium):
+            logger.info(f"[osm] OK : {path.name} ({path.stat().st_size / 1e6:.0f} Mo)")
+            region_files.append(path)
+        else:
+            missing.append(region)
+
+    # 2. Téléchargement uniquement de ce qui manque
+    if missing:
+        logger.info(f"[osm] Téléchargement de {len(missing)} régions manquantes : {missing}")
         with ThreadPoolExecutor(max_workers=4) as exe:
-            futs = {}
-            for region in GEOFABRIK_REGIONS:
-                url = f"{GEOFABRIK_BASE}/{region}-latest.osm.pbf"
-                dest = raw_dir / f"{region}-latest.osm.pbf"
-                futs[exe.submit(_download_with_resume, url, dest, hb_local)] = region
+            futs = {
+                exe.submit(
+                    _download_with_resume,
+                    f"{GEOFABRIK_BASE}/{region}-latest.osm.pbf",
+                    osm_dir / f"{region}-latest.osm.pbf",
+                ): region
+                for region in missing
+            }
             for fut in as_completed(futs):
                 region = futs[fut]
-                try:
-                    region_files.append(fut.result())
-                except Exception as e:
-                    logger.error(f"[osm] Échec téléchargement {region} : {e}")
-                    raise
+                path = fut.result()
+                if not _validate_pbf(path, osmium):
+                    raise RuntimeError(f"[osm] Re-téléchargement de {region} toujours invalide : {path}")
+                region_files.append(path)
 
-    # 2. Merge → un seul PBF
-    merged = raw_dir / "_merged-regions.osm.pbf"
+    # 3. Merge → un seul PBF
+    merged = osm_dir / "_merged-regions.osm.pbf"
+    if merged.exists() and not _validate_pbf(merged, osmium):
+        logger.warning("[osm] Fichier fusionné corrompu, suppression...")
+        merged.unlink()
     if not merged.exists():
-        with hb_local.stage("Fusion PBF (osmium merge)"):
-            cmd = [osmium, "merge", *(str(p) for p in region_files), "-o", str(merged), "--overwrite"]
-            logger.info(f"[osm] {' '.join(cmd[:3])} … (5 fichiers)")
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-            if r.returncode != 0:
-                raise RuntimeError(f"osmium merge a échoué : {r.stderr}")
-        logger.info(f"[osm] Merge OK : {merged} ({merged.stat().st_size / 1e6:.0f} Mo)")
-
-    # 3. Extract bbox
-    with hb_local.stage("Extraction bbox (osmium extract)"):
-        cmd = [
-            osmium, "extract",
-            "--bbox", PERIMETER_BBOX,
-            str(merged),
-            "-o", str(final_pbf),
-            "--strategy=complete-ways",
-            "--overwrite",
-        ]
-        logger.info(f"[osm] osmium extract bbox={PERIMETER_BBOX}")
+        logger.info(f"[osm] osmium merge des {len(region_files)} PBF régionaux...")
+        cmd = [osmium, "merge", *(str(p) for p in region_files), "-o", str(merged), "--overwrite"]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
         if r.returncode != 0:
-            raise RuntimeError(f"osmium extract a échoué : {r.stderr}")
+            raise RuntimeError(f"osmium merge a échoué : {r.stderr}")
+        logger.info(f"[osm] Merge OK : {merged} ({merged.stat().st_size / 1e6:.0f} Mo)")
+
+    # 4. Extract bbox
+    logger.info(f"[osm] osmium extract bbox={PERIMETER_BBOX}")
+    cmd = [
+        osmium, "extract",
+        "--bbox", PERIMETER_BBOX,
+        str(merged),
+        "-o", str(final_pbf),
+        "--strategy=complete_ways",
+        "--overwrite",
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+    if r.returncode != 0:
+        raise RuntimeError(f"osmium extract a échoué : {r.stderr}")
     logger.info(f"[osm] Extract OK : {final_pbf} ({final_pbf.stat().st_size / 1e6:.0f} Mo)")
 
-    # 4. Nettoyage des intermédiaires
+    # 5. Nettoyage du fichier intermédiaire merged si demandé
     if not keep_intermediate:
         merged.unlink(missing_ok=True)
-        for p in region_files:
-            p.unlink(missing_ok=True)
-        logger.info("[osm] Intermédiaires supprimés (libère ~3 Go).")
+        logger.info("[osm] Fichier merged supprimé (libère ~1.5 Go).")
 
     return final_pbf
 
 
 # ---------------------------------------------------------------------------
-# Étape cadastre : téléchargements parallèles + chargement séquentiel
+# Étape cadastre : vérification présence + chargement séquentiel
 # ---------------------------------------------------------------------------
 
-def _parallel_download_cadastre(
-    depts: Iterable[str],
-    raw_dir: Path,
-    hb: HeartbeatLogger,
-    workers: int = CADASTRE_DOWNLOAD_WORKERS,
-) -> None:
-    """Télécharge en parallèle les .json.gz cadastre des départements."""
+def _ensure_cadastre_files(depts: Iterable[str], workers: int = CADASTRE_DOWNLOAD_WORKERS) -> None:
+    """Vérifie la présence des fichiers cadastre et télécharge ceux qui manquent."""
     depts = list(depts)
-    with hb.stage("Téléchargement cadastre Etalab", f"{len(depts)} dépts"):
-        done = 0
-        with ThreadPoolExecutor(max_workers=workers) as exe:
-            futs = {
-                exe.submit(download_department, d, raw_dir): d for d in depts
-            }
+    missing: list[str] = []
+    for dept in depts:
+        d = dept.zfill(2)
+        comm = RAW_CADASTRE_COMMUNES_DIR / f"cadastre-{d}-communes.json.gz"
+        parc = RAW_CADASTRE_PARCELLES_DIR / f"cadastre-{d}-parcelles.json.gz"
+        if not comm.exists() or not parc.exists():
+            missing.append(dept)
+
+    if not missing:
+        logger.info(f"[cadastre] Tous les fichiers présents ({len(depts)} dépts).")
+        return
+
+    logger.info(f"[cadastre] Téléchargement de {len(missing)} dépts manquants : {missing}")
+    with ThreadPoolExecutor(max_workers=workers) as exe:
+        futs = {exe.submit(download_department, d): d for d in missing}
+        with tqdm(total=len(missing), desc="Téléchargement cadastre", unit="dept") as bar:
             for fut in as_completed(futs):
                 d = futs[fut]
                 try:
                     fut.result()
-                    done += 1
-                    hb.update(f"{done}/{len(depts)} départements téléchargés")
                 except Exception as e:
                     logger.error(f"[cadastre] Échec téléchargement dept {d} : {e}")
                     raise
-    logger.info(f"[cadastre] Tous les téléchargements OK ({done}/{len(depts)})")
+                bar.update(1)
 
 
-def _sequential_load_cadastre(
-    depts: Iterable[str],
-    db_path: Path,
-    hb: HeartbeatLogger,
-) -> None:
+def _sequential_load_cadastre(depts: Iterable[str], db_path: Path) -> None:
     """Charge les départements dans DuckDB un par un (single connection)."""
     depts = list(depts)
-    with hb.stage("Chargement cadastre → DuckDB"):
-        for i, dept in enumerate(depts, 1):
-            hb.update(f"dept {dept} ({i}/{len(depts)})")
-            t0 = time.monotonic()
-            try:
-                load_department_to_duckdb(dept, db_path=db_path)
-                logger.info(
-                    f"[cadastre] [{i}/{len(depts)}] dept {dept} OK "
-                    f"({time.monotonic() - t0:.1f}s)"
-                )
-            except Exception as e:
-                logger.error(f"[cadastre] dept {dept} ÉCHEC : {e}")
-                raise
+    for i, dept in enumerate(depts, 1):
+        t0 = time.monotonic()
+        try:
+            load_department_to_duckdb(dept, db_path=db_path)
+            # Log plus discret pour éviter les heartbeats massifs
+            if i % 5 == 0 or i == len(depts):
+                logger.info(f"[cadastre] Progression : {i}/{len(depts)} départements chargés.")
+        except Exception as e:
+            logger.error(f"[cadastre] dept {dept} ÉCHEC : {e}")
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -389,17 +321,18 @@ def apply_duckdb_pragmas(
 @dataclass
 class BuildOptions:
     db_path: Path = DB_PATH
-    raw_dir: Path = DATA_RAW
+    osm_dir: Path = RAW_OSM_DIR
     departments: list[str] = field(default_factory=lambda: list(DEPARTMENTS))
     skip_cadastre: bool = False
     skip_osm: bool = False
     skip_dpe: bool = False
     skip_adjacency: bool = False
     skip_parcel_adjacency: bool = False
-    keep_intermediate_pbf: bool = False
+    keep_intermediate_pbf: bool = True
     duckdb_threads: int | None = None
     duckdb_memory_limit: str = "24GB"
     cadastre_download_workers: int = CADASTRE_DOWNLOAD_WORKERS
+    parcel_adjacency_workers: int | None = None
 
 
 def build_database(opts: BuildOptions | None = None) -> dict:
@@ -407,8 +340,8 @@ def build_database(opts: BuildOptions | None = None) -> dict:
 
     Étapes (séquentielles) :
         1. Préparation environnement & PRAGMA DuckDB
-        2. Cadastre (parallèle download + sequential load)
-        3. OSM (download + merge + extract + ingestion)
+        2. Cadastre (vérification + chargement)
+        3. OSM (validation PBF + merge + extract + ingestion)
         4. DPE
         5. Adjacence communes
         6. Adjacence parcelles
@@ -418,136 +351,119 @@ def build_database(opts: BuildOptions | None = None) -> dict:
     """
     opts = opts or BuildOptions()
     opts.db_path.parent.mkdir(parents=True, exist_ok=True)
-    opts.raw_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=" * 70)
     logger.info("CADASTRE-FINDER — Construction complète de la base de données")
     logger.info("=" * 70)
     logger.info(f"  Base       : {opts.db_path}")
-    logger.info(f"  Raw dir    : {opts.raw_dir}")
+    logger.info(f"  OSM dir    : {opts.osm_dir}")
     logger.info(f"  Dépts      : {len(opts.departments)} ({', '.join(opts.departments)})")
     logger.info(f"  DuckDB     : threads={opts.duckdb_threads or _default_threads()}, "
                 f"memory_limit={opts.duckdb_memory_limit}")
 
-    # PRAGMAs (créent la DB si elle n'existe pas)
     apply_duckdb_pragmas(
         opts.db_path,
         threads=opts.duckdb_threads,
         memory_limit=opts.duckdb_memory_limit,
     )
 
-    hb = HeartbeatLogger(interval=HEARTBEAT_INTERVAL_S)
-    hb.start()
     bilan: dict[str, dict] = {}
     t_global = time.monotonic()
 
-    try:
-        # ----- 1. Cadastre ------------------------------------------------
-        if not opts.skip_cadastre:
-            t0 = time.monotonic()
-            try:
-                _parallel_download_cadastre(
-                    opts.departments, opts.raw_dir, hb,
-                    workers=opts.cadastre_download_workers,
-                )
-                _sequential_load_cadastre(opts.departments, opts.db_path, hb)
-                bilan["cadastre"] = {"status": "ok", "elapsed_s": time.monotonic() - t0}
-            except Exception as e:
-                bilan["cadastre"] = {"status": "error", "error": str(e),
-                                     "elapsed_s": time.monotonic() - t0}
-                raise
-        else:
-            logger.info("[cadastre] Étape ignorée (--skip-cadastre).")
-            bilan["cadastre"] = {"status": "skipped"}
+    # ----- 1. Cadastre ----------------------------------------------------
+    if not opts.skip_cadastre:
+        logger.info("=== Cadastre ===")
+        t0 = time.monotonic()
+        try:
+            _ensure_cadastre_files(opts.departments, workers=opts.cadastre_download_workers)
+            _sequential_load_cadastre(opts.departments, opts.db_path)
+            bilan["cadastre"] = {"status": "ok", "elapsed_s": time.monotonic() - t0}
+        except Exception as e:
+            bilan["cadastre"] = {"status": "error", "error": str(e),
+                                 "elapsed_s": time.monotonic() - t0}
+            raise
+    else:
+        logger.info("[cadastre] Étape ignorée (--skip-cadastre).")
+        bilan["cadastre"] = {"status": "skipped"}
 
-        # ----- 2. OSM -----------------------------------------------------
-        if not opts.skip_osm:
-            t0 = time.monotonic()
-            try:
-                pbf = prepare_regional_pbf(
-                    raw_dir=opts.raw_dir,
-                    hb=hb,
-                    keep_intermediate=opts.keep_intermediate_pbf,
-                )
-                with hb.stage("Ingestion OSM → DuckDB"):
-                    from cadastre_finder.ingestion.osm import load_osm_to_duckdb
-                    load_osm_to_duckdb(pbf_path=pbf, db_path=opts.db_path)
-                bilan["osm"] = {"status": "ok", "elapsed_s": time.monotonic() - t0}
-            except Exception as e:
-                bilan["osm"] = {"status": "error", "error": str(e),
-                                "elapsed_s": time.monotonic() - t0}
-                logger.error(f"[osm] Échec : {e}")
-                # On continue les autres étapes : OSM n'est pas bloquant pour la suite.
-        else:
-            logger.info("[osm] Étape ignorée (--skip-osm).")
-            bilan["osm"] = {"status": "skipped"}
+    # ----- 2. OSM ---------------------------------------------------------
+    if not opts.skip_osm:
+        logger.info("=== OSM ===")
+        t0 = time.monotonic()
+        try:
+            pbf = prepare_regional_pbf(
+                osm_dir=opts.osm_dir,
+                keep_intermediate=opts.keep_intermediate_pbf,
+            )
+            from cadastre_finder.ingestion.osm import load_osm_to_duckdb
+            load_osm_to_duckdb(pbf_path=pbf, db_path=opts.db_path)
+            bilan["osm"] = {"status": "ok", "elapsed_s": time.monotonic() - t0}
+        except Exception as e:
+            bilan["osm"] = {"status": "error", "error": str(e),
+                            "elapsed_s": time.monotonic() - t0}
+            logger.error(f"[osm] Échec : {e}")
+    else:
+        logger.info("[osm] Étape ignorée (--skip-osm).")
+        bilan["osm"] = {"status": "skipped"}
 
-        # ----- 3. DPE -----------------------------------------------------
-        if not opts.skip_dpe:
-            t0 = time.monotonic()
-            try:
-                with hb.stage("Ingestion DPE ADEME"):
-                    from cadastre_finder.ingestion.dpe import (
-                        download_dpe_data,
-                        load_dpe_to_duckdb,
-                    )
-                    csv_path = download_dpe_data()
-                    hb.update(f"chargement {csv_path.name}")
-                    load_dpe_to_duckdb(csv_path, db_path=opts.db_path)
-                bilan["dpe"] = {"status": "ok", "elapsed_s": time.monotonic() - t0}
-            except Exception as e:
-                bilan["dpe"] = {"status": "error", "error": str(e),
-                                "elapsed_s": time.monotonic() - t0}
-                logger.error(f"[dpe] Échec : {e}")
-                # Non bloquant
-        else:
-            logger.info("[dpe] Étape ignorée (--skip-dpe).")
-            bilan["dpe"] = {"status": "skipped"}
+    # ----- 3. DPE ---------------------------------------------------------
+    if not opts.skip_dpe:
+        logger.info("=== DPE ===")
+        t0 = time.monotonic()
+        try:
+            from cadastre_finder.ingestion.dpe import (
+                download_dpe_data,
+                load_dpe_to_duckdb,
+            )
+            csv_path = download_dpe_data()
+            load_dpe_to_duckdb(csv_path, db_path=opts.db_path)
+            bilan["dpe"] = {"status": "ok", "elapsed_s": time.monotonic() - t0}
+        except Exception as e:
+            bilan["dpe"] = {"status": "error", "error": str(e),
+                            "elapsed_s": time.monotonic() - t0}
+            logger.error(f"[dpe] Échec : {e}")
+    else:
+        logger.info("[dpe] Étape ignorée (--skip-dpe).")
+        bilan["dpe"] = {"status": "skipped"}
 
-        # ----- 4. Adjacence communes --------------------------------------
-        if not opts.skip_adjacency:
-            t0 = time.monotonic()
-            try:
-                with hb.stage("Adjacence communes"):
-                    from cadastre_finder.processing.adjacency import (
-                        build_adjacency_table,
-                    )
-                    build_adjacency_table(db_path=opts.db_path, include_rank2=True)
-                bilan["adjacency"] = {"status": "ok",
-                                      "elapsed_s": time.monotonic() - t0}
-            except Exception as e:
-                bilan["adjacency"] = {"status": "error", "error": str(e),
-                                      "elapsed_s": time.monotonic() - t0}
-                logger.error(f"[adjacency] Échec : {e}")
-        else:
-            logger.info("[adjacency] Étape ignorée.")
-            bilan["adjacency"] = {"status": "skipped"}
+    # ----- 4. Adjacence communes ------------------------------------------
+    if not opts.skip_adjacency:
+        logger.info("=== Adjacence communes ===")
+        t0 = time.monotonic()
+        try:
+            from cadastre_finder.processing.adjacency import build_adjacency_table
+            build_adjacency_table(db_path=opts.db_path, include_rank2=True)
+            bilan["adjacency"] = {"status": "ok",
+                                  "elapsed_s": time.monotonic() - t0}
+        except Exception as e:
+            bilan["adjacency"] = {"status": "error", "error": str(e),
+                                  "elapsed_s": time.monotonic() - t0}
+            logger.error(f"[adjacency] Échec : {e}")
+    else:
+        logger.info("[adjacency] Étape ignorée.")
+        bilan["adjacency"] = {"status": "skipped"}
 
-        # ----- 5. Adjacence parcelles -------------------------------------
-        if not opts.skip_parcel_adjacency:
-            t0 = time.monotonic()
-            try:
-                with hb.stage("Adjacence parcelles", "Shapely STRtree"):
-                    from cadastre_finder.processing.parcel_adjacency import (
-                        build_parcel_adjacency,
-                    )
-                    build_parcel_adjacency(
-                        db_path=opts.db_path,
-                        departments=opts.departments,
-                        force=False,
-                    )
-                bilan["parcel_adjacency"] = {"status": "ok",
-                                             "elapsed_s": time.monotonic() - t0}
-            except Exception as e:
-                bilan["parcel_adjacency"] = {"status": "error", "error": str(e),
-                                             "elapsed_s": time.monotonic() - t0}
-                logger.error(f"[parcel_adjacency] Échec : {e}")
-        else:
-            logger.info("[parcel_adjacency] Étape ignorée.")
-            bilan["parcel_adjacency"] = {"status": "skipped"}
-
-    finally:
-        hb.stop()
+    # ----- 5. Adjacence parcelles -----------------------------------------
+    if not opts.skip_parcel_adjacency:
+        logger.info("=== Adjacence parcelles ===")
+        t0 = time.monotonic()
+        try:
+            from cadastre_finder.processing.parcel_adjacency import build_parcel_adjacency
+            build_parcel_adjacency(
+                db_path=opts.db_path,
+                departments=opts.departments,
+                force=False,
+                workers=opts.parcel_adjacency_workers,
+            )
+            bilan["parcel_adjacency"] = {"status": "ok",
+                                         "elapsed_s": time.monotonic() - t0}
+        except Exception as e:
+            bilan["parcel_adjacency"] = {"status": "error", "error": str(e),
+                                         "elapsed_s": time.monotonic() - t0}
+            logger.error(f"[parcel_adjacency] Échec : {e}")
+    else:
+        logger.info("[parcel_adjacency] Étape ignorée.")
+        bilan["parcel_adjacency"] = {"status": "skipped"}
 
     # ----- Bilan ----------------------------------------------------------
     total = time.monotonic() - t_global

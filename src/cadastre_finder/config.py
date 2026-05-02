@@ -8,10 +8,17 @@ DATA_RAW = ROOT_DIR / "data" / "raw"
 DATA_PROCESSED = ROOT_DIR / "data" / "processed"
 OUTPUT_DIR = ROOT_DIR / "out"
 
+# Sous-arborescence data/raw
+RAW_OSM_DIR = DATA_RAW / "osm"
+RAW_CADASTRE_DIR = DATA_RAW / "cadastre"
+RAW_CADASTRE_COMMUNES_DIR = RAW_CADASTRE_DIR / "communes"
+RAW_CADASTRE_PARCELLES_DIR = RAW_CADASTRE_DIR / "parcelles"
+RAW_ADEME_DIR = DATA_RAW / "ademe"
+
 # Base DuckDB par défaut
 DB_PATH = DATA_PROCESSED / "cadastre.duckdb"
 
-# 20 départements du périmètre : Ouest de la France
+# 21 départements du périmètre : Ouest de la France + Oise
 DEPARTMENTS = [
     "76",  # Seine-Maritime
     "27",  # Eure
@@ -33,6 +40,7 @@ DEPARTMENTS = [
     "37",  # Indre-et-Loire
     "41",  # Loir-et-Cher
     "45",  # Loiret
+    "60",  # Oise
 ]
 
 # URLs sources
@@ -51,5 +59,7 @@ DEFAULT_TOP_N = 20
 
 # DPE settings
 DPE_TABLE = "dpe"
-# ADEME DPE Open Data URL (Logements existants - version 2.0)
-DPE_URL = "https://data.ademe.fr/datasets/dpe-v2-logements-existants/download"
+# ADEME DPE Open Data — Logements existants depuis juillet 2021
+# Dataset : https://data.ademe.fr/datasets/dpe03existant
+DPE_URL = "https://data.ademe.fr/streamsaver/data.ademe.fr/645298/dpe03existant.csv"
+DPE_CSV_PATH = RAW_ADEME_DIR / "dpe03existant.csv"

@@ -67,12 +67,12 @@ def cmd_ingest_dpe(args: argparse.Namespace) -> int:
 def cmd_build_database(args: argparse.Namespace) -> int:
     """Construit toute la base en une commande : cadastre + OSM + DPE + adjacences."""
     from cadastre_finder.ingestion.build_all import BuildOptions, build_database
-    from cadastre_finder.config import DEPARTMENTS, DATA_RAW
+    from cadastre_finder.config import DEPARTMENTS, RAW_OSM_DIR
 
     depts = args.dept if args.dept else list(DEPARTMENTS)
     opts = BuildOptions(
         db_path=Path(args.db),
-        raw_dir=Path(args.raw_dir) if args.raw_dir else DATA_RAW,
+        osm_dir=Path(args.osm_dir) if args.osm_dir else RAW_OSM_DIR,
         departments=depts,
         skip_cadastre=args.skip_cadastre,
         skip_osm=args.skip_osm,
@@ -83,6 +83,7 @@ def cmd_build_database(args: argparse.Namespace) -> int:
         duckdb_threads=args.threads,
         duckdb_memory_limit=args.memory_limit,
         cadastre_download_workers=args.download_workers,
+        parcel_adjacency_workers=args.parcel_workers,
     )
     bilan = build_database(opts)
     # Code retour : 1 si une étape critique (cadastre) a échoué
@@ -111,6 +112,7 @@ def cmd_build_parcel_adjacency(args: argparse.Namespace) -> int:
         departments=depts,
         communes=communes,
         force=args.force,
+        workers=args.workers,
     )
     return 0
 
@@ -268,17 +270,16 @@ def main() -> None:
         help="Construit toute la base en une commande (cadastre + OSM + DPE + adjacences)",
         description=(
             "Construction autonome et idempotente de l'intégralité de la base : "
-            "téléchargement automatique des PBF Geofabrik, ingestion cadastre Etalab "
-            "des 20 départements, OSM (POI/routes/bâtiments), DPE ADEME, et "
-            "pré-calculs d'adjacence. Heartbeat toutes les 60 s pour garantir la "
-            "vivacité des logs."
+            "vérification des PBF Geofabrik, ingestion cadastre Etalab des 21 "
+            "départements, OSM (POI/routes/bâtiments), DPE ADEME, et "
+            "pré-calculs d'adjacence (communes + parcelles, parallélisé)."
         ),
     )
     p_build.add_argument(
         "--dept", nargs="+", metavar="DEPT",
-        help="Sous-ensemble de départements (par défaut : les 20 du périmètre)",
+        help="Sous-ensemble de départements (par défaut : les 21 du périmètre)",
     )
-    p_build.add_argument("--raw-dir", help="Répertoire des fichiers raw (défaut : data/raw)")
+    p_build.add_argument("--osm-dir", help="Répertoire des PBF OSM (défaut : data/raw/osm)")
     p_build.add_argument("--skip-cadastre", action="store_true",
                          help="Ne pas (ré)ingérer les parcelles cadastre")
     p_build.add_argument("--skip-osm", action="store_true",
@@ -289,14 +290,16 @@ def main() -> None:
                          help="Ne pas calculer l'adjacence des communes")
     p_build.add_argument("--skip-parcel-adjacency", action="store_true",
                          help="Ne pas calculer l'adjacence des parcelles (étape la plus longue)")
-    p_build.add_argument("--keep-intermediate-pbf", action="store_true",
-                         help="Conserver les PBF régionaux et le fichier merged après extraction")
+    p_build.add_argument("--keep-intermediate-pbf", action="store_true", default=True,
+                         help="Conserver le PBF merged après extraction (défaut : True)")
     p_build.add_argument("--threads", type=int, default=None,
                          help="Threads DuckDB (défaut : nombre de cœurs logiques)")
     p_build.add_argument("--memory-limit", default="24GB",
                          help="Limite mémoire DuckDB (défaut : 24GB)")
     p_build.add_argument("--download-workers", type=int, default=8,
                          help="Téléchargements cadastre concurrents (défaut : 8)")
+    p_build.add_argument("--parcel-workers", type=int, default=None,
+                         help="Workers pour adjacence parcellaire (défaut : cpu-1)")
     p_build.set_defaults(func=cmd_build_database)
 
     # build-adjacency
@@ -309,6 +312,7 @@ def main() -> None:
     p_padj.add_argument("--dept", nargs="+", metavar="DEPT", help="Limiter à ces départements")
     p_padj.add_argument("--communes", nargs="+", metavar="INSEE", help="Reconstruire uniquement ces codes INSEE (ex: 28103)")
     p_padj.add_argument("--force", action="store_true", help="Effacer et recalculer les communes déjà traitées")
+    p_padj.add_argument("--workers", type=int, default=None, help="Nb processus parallèles (défaut : cpu-1)")
     p_padj.set_defaults(func=cmd_build_parcel_adjacency)
 
     # search
