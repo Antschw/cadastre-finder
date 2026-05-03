@@ -18,6 +18,7 @@ from shapely.strtree import STRtree
 from tqdm import tqdm
 
 from cadastre_finder.config import DB_PATH
+from cadastre_finder.search.models import NeighborMode
 
 _BUFFER_DEG = 0.00001   # ≈ 1 m à la latitude de la France
 _BATCH_INSERT = 10_000  # paires par executemany
@@ -203,6 +204,37 @@ def get_neighbors(
         return [r[0] for r in rows]
     finally:
         con.close()
+
+
+def resolve_insee_scope(
+    code_insee: str,
+    mode: NeighborMode,
+    db_path: Path = DB_PATH,
+) -> dict[str, int]:
+    """Retourne le périmètre INSEE pour la recherche, indexé par rang.
+
+    `{code_insee_principal: 0, voisin_rang1: 1, voisin_rang2: 2, ...}`.
+    Pour mode `NONE`, seule la commune principale est incluse.
+    """
+    scope: dict[str, int] = {code_insee: 0}
+    if mode is NeighborMode.NONE:
+        return scope
+
+    max_rang = 1 if mode is NeighborMode.RANK1 else 2
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        rows = con.execute(
+            "SELECT code_insee_b, MIN(rang) FROM communes_adjacency "
+            "WHERE code_insee_a = ? AND rang <= ? GROUP BY code_insee_b",
+            [code_insee, max_rang],
+        ).fetchall()
+    finally:
+        con.close()
+
+    for code_b, rang in rows:
+        if code_b not in scope:
+            scope[code_b] = rang
+    return scope
 
 
 if __name__ == "__main__":

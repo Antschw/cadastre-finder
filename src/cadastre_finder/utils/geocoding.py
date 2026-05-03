@@ -1,9 +1,15 @@
-"""Géocodage commune → code INSEE.
+"""Géocodage via la Géoplateforme IGN.
 
-Stratégie :
-1. Recherche locale dans la table `communes` DuckDB
-2. Fallback sur l'API Adresse (api-adresse.data.gouv.fr)
-3. Cache JSON local des résultats API
+L'API `api-adresse.data.gouv.fr` (BAN) a été décommissionnée fin janvier 2026 ;
+toutes les requêtes passent désormais par `data.geopf.fr/geocodage`.
+
+Stratégies :
+1. Résolution commune → INSEE : recherche locale dans la table `communes`,
+   fallback sur `/search?index=poi&type=municipality`.
+2. Géocodage adresse complète → (lat, lon) via `/search?index=address`.
+3. Reverse parcelle → id cadastral via `/reverse?index=parcel`.
+
+Cache JSON local pour les résolutions de commune.
 """
 from __future__ import annotations
 
@@ -17,7 +23,7 @@ import duckdb
 import httpx
 from loguru import logger
 
-from cadastre_finder.config import API_ADRESSE_URL, DATA_PROCESSED, DB_PATH
+from cadastre_finder.config import GEOPF_API_URL, DATA_PROCESSED, DB_PATH
 
 CACHE_PATH = DATA_PROCESSED / "geocoding_cache.json"
 
@@ -104,7 +110,7 @@ def _search_api(
     name: str,
     postal_code: Optional[str],
 ) -> list[CommuneInfo]:
-    """Interroge l'API Adresse pour résoudre une commune."""
+    """Interroge l'API Géoplateforme pour résoudre une commune."""
     cache = _load_cache()
     cache_key = f"{_normalize(name)}|{postal_code or ''}"
 
@@ -114,6 +120,7 @@ def _search_api(
 
     params: dict[str, str] = {
         "q": name,
+        "index": "poi",
         "type": "municipality",
         "limit": "10",
     }
@@ -122,21 +129,27 @@ def _search_api(
 
     try:
         resp = httpx.get(
-            f"{API_ADRESSE_URL}/search/",
+            f"{GEOPF_API_URL}/search",
             params=params,
             timeout=10,
         )
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        logger.warning(f"[geocoding] API Adresse indisponible : {e}")
+        logger.warning(f"[geocoding] Géoplateforme indisponible pour '{name}' : {e}")
         return []
 
     results = []
     for feat in data.get("features", []):
         props = feat.get("properties", {})
         code_insee = props.get("citycode", "")
+        if isinstance(code_insee, list) and code_insee:
+            code_insee = code_insee[0]
+
         nom = props.get("city", "")
+        if isinstance(nom, list) and nom:
+            nom = nom[0]
+
         score = props.get("score", 0.0)
         code_dept = code_insee[:2] if len(code_insee) >= 2 else ""
 
@@ -155,24 +168,54 @@ def _search_api(
     return results
 
 
-def geocode_address(address: str, city: Optional[str] = None, postcode: Optional[str] = None) -> Optional[tuple[float, float]]:
-    """Géo-code une adresse complète via l'API Adresse. Retourne (lat, lon) ou None."""
-    params = {"q": address}
-    if city:
+def geocode_address(
+    address: str,
+    city: Optional[str] = None,
+    postcode: Optional[str] = None,
+    citycode: Optional[str] = None,
+) -> Optional[tuple[float, float]]:
+    """Géo-code une adresse complète via la Géoplateforme. Retourne (lat, lon) ou None."""
+    params = {
+        "q": address,
+        "index": "address",
+        "limit": 1,
+    }
+    if citycode:
+        params["citycode"] = citycode
+    elif city:
         params["city"] = city
     if postcode:
         params["postcode"] = postcode
-    
+
     try:
-        resp = httpx.get(f"{API_ADRESSE_URL}/search/", params=params, timeout=5)
+        resp = httpx.get(f"{GEOPF_API_URL}/search", params=params, timeout=5)
         resp.raise_for_status()
         data = resp.json()
         if data.get("features"):
             coords = data["features"][0]["geometry"]["coordinates"]
-            return coords[1], coords[0]  # Lat, Lon
+            return coords[1], coords[0]  # lat, lon
     except Exception as e:
-        logger.debug(f"[geocoding] Erreur géocodage adresse '{address}': {e}")
-    
+        logger.debug(f"[geocoding] Erreur géocodage adresse '{address}' : {e}")
+
+    return None
+
+
+def reverse_geocode_parcel(lat: float, lon: float) -> Optional[str]:
+    """Trouve l'ID de la parcelle cadastrale aux coordonnées données via l'API Géoplateforme."""
+    params = {
+        "lat": lat,
+        "lon": lon,
+        "index": "parcel",
+        "limit": 1,
+    }
+    try:
+        resp = httpx.get(f"{GEOPF_API_URL}/reverse", params=params, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("features"):
+            return data["features"][0]["properties"].get("id")
+    except Exception as e:
+        logger.debug(f"[geocoding] Erreur reverse geocoding parcelle ({lat}, {lon}) : {e}")
     return None
 
 
@@ -183,9 +226,8 @@ def resolve_commune(
 ) -> ResolveResult:
     """Résout un nom de commune en code(s) INSEE.
 
-    Stratégie :
     1. Recherche locale dans la table communes DuckDB
-    2. Si vide, fallback sur l'API Adresse
+    2. Sinon, fallback sur la Géoplateforme
     3. Retourne un ResolveResult avec la liste des candidats triés par score
 
     Exemples :
@@ -198,7 +240,7 @@ def resolve_commune(
         logger.debug(f"[geocoding] '{name}' → {len(local)} résultat(s) local/locaux")
         return ResolveResult(candidates=local)
 
-    logger.info(f"[geocoding] '{name}' non trouvé localement, interrogation API Adresse...")
+    logger.info(f"[geocoding] '{name}' non trouvé localement, interrogation Géoplateforme...")
     api_results = _search_api(name, postal_code)
 
     if not api_results:

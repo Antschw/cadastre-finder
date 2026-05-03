@@ -2,7 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
+
+
+class NeighborMode(str, Enum):
+    """Périmètre d'extension géographique de la recherche."""
+    NONE = "none"      # commune principale uniquement
+    RANK1 = "rank1"    # principale + voisines directes
+    RANK2 = "rank2"    # principale + rang 1 + rang 2
 
 
 @dataclass

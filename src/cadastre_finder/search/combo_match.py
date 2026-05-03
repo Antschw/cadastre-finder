@@ -16,11 +16,11 @@ from shapely.geometry import shape
 from shapely.ops import unary_union
 
 from cadastre_finder.config import (
-    DB_PATH, DEFAULT_TOLERANCE_PCT, DEFAULT_TOP_N, MIN_TERRAIN_M2, MIN_ANCHOR_BUILT_M2
+    DB_PATH, DEFAULT_TOLERANCE_PCT, DEFAULT_TOP_N, MIN_ANCHOR_BUILT_M2
 )
-from cadastre_finder.processing.adjacency import get_neighbors
+from cadastre_finder.processing.adjacency import resolve_insee_scope
 from cadastre_finder.search.building_filter import filter_built_combos, filter_built_parcels
-from cadastre_finder.search.models import ComboMatch, ParcelMatch
+from cadastre_finder.search.models import ComboMatch, NeighborMode, ParcelMatch
 from cadastre_finder.utils.geocoding import resolve_commune
 
 MIN_PART_M2 = 10        # Seuil absolu minimum (parcelles accessoires très petites)
@@ -38,7 +38,10 @@ def _fetch_candidates(
     min_contenance: float,
     max_contenance: float,
     commune_noms: dict[str, str],
+    scope_rang: Optional[dict[str, int]] = None,
 ) -> list[ParcelMatch]:
+    if scope_rang is None:
+        scope_rang = {c: 0 for c in codes_insee}
     placeholders = ", ".join("?" * len(codes_insee))
     rows = con.execute(f"""
         SELECT
@@ -62,6 +65,7 @@ def _fetch_candidates(
             centroid_lon=row[3],
             centroid_lat=row[4],
             geometry_geojson=row[5] or "{}",
+            rank=scope_rang.get(row[1], 0),
         )
         for row in rows
     ]
@@ -173,6 +177,11 @@ def _polsby_popper(geom) -> float:
         return 0.0
 
 
+def polsby_popper(geom) -> float:
+    """Alias public pour la mesure de compacité (utilisée par building_filter)."""
+    return _polsby_popper(geom)
+
+
 def _build_combo(parts: list[ParcelMatch], target_m2: float) -> ComboMatch:
     total = sum(p.contenance for p in parts)
     rank = min(p.rank for p in parts)
@@ -236,7 +245,6 @@ def _find_combos_dfs(
     max_parts: int,
     top_n: int,
     start_indices: Optional[list[int]] = None,
-    min_compactness: float = 0.2,
 ) -> list[ComboMatch]:
     """DFS sur le graphe d'adjacence pour trouver les sous-ensembles connexes dans la plage."""
     if not candidates:
@@ -268,9 +276,7 @@ def _find_combos_dfs(
         if lo <= total <= hi and len(combo) >= 2:
             parts = [candidates[i] for i in combo]
             c = _build_combo(parts, target_m2)
-            # Filtrage par compacité : on ignore les formes trop allongées ou fragmentées
-            if c.compactness >= min_compactness:
-                results.append(c)
+            results.append(c)
 
         if total >= hi or len(combo) >= max_parts:
             return
@@ -337,7 +343,7 @@ def search_combos(
     surface_m2: float,
     postal_code: Optional[str] = None,
     tolerance_pct: float = DEFAULT_TOLERANCE_PCT,
-    include_rank2: bool = False,
+    neighbor_mode: NeighborMode = NeighborMode.NONE,
     max_parts: int = MAX_PARTS,
     top_n: int = DEFAULT_TOP_N,
     built_only: bool = True,
@@ -358,19 +364,12 @@ def search_combos(
     code_insee_main = best.code_insee
     nom_main = best.nom
 
-    max_rang = 2 if include_rank2 else 1
+    scope_rang = resolve_insee_scope(code_insee_main, neighbor_mode, db_path)
+    all_codes = list(scope_rang.keys())
 
     con = duckdb.connect(str(db_path), read_only=True)
     try:
         con.execute("LOAD spatial;")
-
-        neighbors_rows = con.execute(
-            "SELECT code_insee_b, MIN(rang) FROM communes_adjacency "
-            "WHERE code_insee_a = ? AND rang <= ? GROUP BY code_insee_b",
-            [code_insee_main, max_rang],
-        ).fetchall()
-
-        all_codes = [code_insee_main] + [r[0] for r in neighbors_rows]
 
         nom_rows = con.execute(
             f"SELECT code_insee, nom FROM communes WHERE code_insee IN "
@@ -388,12 +387,15 @@ def search_combos(
         min_single = max(MIN_PART_M2, int(surface_m2 / 500))
 
         logger.info(
-            f"[combo_match] Recherche combos sur {len(all_codes)} commune(s), "
-            f"cible {surface_m2:.0f} m² ±{tolerance_pct}%, max {max_parts} parcelles, "
+            f"[combo_match] Recherche combos sur {len(all_codes)} commune(s) "
+            f"(mode={neighbor_mode.value}), cible {surface_m2:.0f} m² "
+            f"±{tolerance_pct}%, max {max_parts} parcelles, "
             f"candidats [{min_single}–{max_single:.0f}] m²"
         )
 
-        candidates = _fetch_candidates(con, all_codes, min_single, max_single, commune_noms)
+        candidates = _fetch_candidates(
+            con, all_codes, min_single, max_single, commune_noms, scope_rang
+        )
         logger.info(f"[combo_match] {len(candidates)} parcelles candidates")
 
         if not candidates:
@@ -406,13 +408,34 @@ def search_combos(
 
         start_indices = None
         if anchors_only:
-            # On calcule built_area pour tous les candidats
             candidates = filter_built_parcels(candidates, con, drop_unbuilt=False)
-            start_indices = [
-                i for i, c in enumerate(candidates) 
+            id_to_idx = {c.id_parcelle: i for i, c in enumerate(candidates)}
+            anchor_idx_set = {
+                i for i, c in enumerate(candidates)
                 if (c.built_area and c.built_area >= MIN_ANCHOR_BUILT_M2) or c.built_area == -1.0
-            ]
-            logger.info(f"[combo_match] {len(start_indices)} parcelles ancres (>= {MIN_ANCHOR_BUILT_M2}m² bâti)")
+            }
+            anchor_id_set = {candidates[i].id_parcelle for i in anchor_idx_set}
+
+            # Correction de l'ordre canonique du DFS : si une parcelle non-bâtie A a un
+            # indice inférieur à son ancre voisine B, le DFS démarrant de B saute A
+            # (règle idx <= max_idx) → le combo [A, B, …] n'est jamais découvert.
+            # On ajoute ces non-ancres de plus bas indice comme départs supplémentaires,
+            # placés EN PREMIER pour consommer peu de budget avant les ancres.
+            lower_non_anchors = {
+                id_to_idx[nbr]
+                for i in anchor_idx_set
+                for nbr in graph.get(candidates[i].id_parcelle, set())
+                if nbr in id_to_idx
+                and id_to_idx[nbr] < i
+                and nbr not in anchor_id_set
+            }
+
+            start_indices = sorted(lower_non_anchors) + sorted(anchor_idx_set)
+            n_extra = len(lower_non_anchors)
+            logger.info(
+                f"[combo_match] {len(anchor_idx_set)} ancres (>= {MIN_ANCHOR_BUILT_M2}m² bâti)"
+                + (f" + {n_extra} voisins non-ancres de plus bas indice" if n_extra else "")
+            )
 
         combos = _find_combos_dfs(candidates, graph, surface_m2, tolerance_pct, max_parts, top_n * 3, start_indices=start_indices)
         combos = _deduplicate_combos(combos, surface_m2)

@@ -16,7 +16,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from cadastre_finder.config import DB_PATH
-from cadastre_finder.search.models import ComboMatch, ParcelMatch
+from cadastre_finder.search.models import ComboMatch, NeighborMode, ParcelMatch
 
 # ---------------------------------------------------------------------------
 # Configuration de la page
@@ -313,7 +313,7 @@ def _run_search(
     ges: str | None,
     postal: str | None,
     tolerance_m2: float,
-    rank2: bool,
+    neighbor_mode: str,
     db_path_str: str,
 ) -> list[Union[ParcelMatch, ComboMatch]]:
     from cadastre_finder.search.orchestrator import search_orchestrated
@@ -329,6 +329,7 @@ def _run_search(
         ges_label=ges,
         postal_code=postal,
         tolerance_pct=tolerance_pct,
+        neighbor_mode=NeighborMode(neighbor_mode),
         db_path=db_path,
     )
 
@@ -394,7 +395,19 @@ def _sidebar() -> dict | None:
     tolerance_m2 = st.sidebar.number_input(
         "Tolérance ±m²", min_value=0, max_value=5_000, value=100, step=10
     )
-    rank2 = st.sidebar.checkbox("Communes voisines rang 2", value=True)
+
+    neighbor_label = st.sidebar.radio(
+        "Voisinage",
+        options=["Aucun", "Voisines rang 1", "Voisines rang 2"],
+        index=0,
+        horizontal=True,
+        help="Étend progressivement la recherche aux communes voisines.",
+    )
+    neighbor_mode = {
+        "Aucun": NeighborMode.NONE,
+        "Voisines rang 1": NeighborMode.RANK1,
+        "Voisines rang 2": NeighborMode.RANK2,
+    }[neighbor_label]
 
     st.sidebar.divider()
     launched = st.sidebar.button("Lancer la recherche", type="primary", use_container_width=True)
@@ -413,7 +426,7 @@ def _sidebar() -> dict | None:
         "ges": ges,
         "postal": postal.strip() or None,
         "tolerance_m2": float(tolerance_m2),
-        "rank2": rank2,
+        "neighbor_mode": neighbor_mode.value,
     }
 
 
@@ -448,7 +461,7 @@ def main() -> None:
                 ges=p.get("ges"),
                 postal=p["postal"],
                 tolerance_m2=p["tolerance_m2"],
-                rank2=p["rank2"],
+                neighbor_mode=p["neighbor_mode"],
                 db_path_str=str(DB_PATH),
             )
         except Exception as exc:
@@ -457,7 +470,7 @@ def main() -> None:
 
     if not all_results:
         st.warning(
-            "Aucun résultat. Augmentez la tolérance ou activez les communes voisines rang 2."
+            "Aucun résultat. Augmentez la tolérance ou élargissez le voisinage (rang 1 ou 2)."
         )
         return
 
