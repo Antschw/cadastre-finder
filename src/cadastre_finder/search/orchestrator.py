@@ -63,10 +63,6 @@ def search_orchestrated(
     finally:
         con.close()
 
-    if len(all_results) >= 3:
-        logger.info(f"Phase 1 suffisante : {len(all_results)} résultats.")
-        return _sort_and_limit(all_results, surface_m2)
-
     # Phase 2 : Local Combo Match (Anchors only)
     logger.info("Phase 2 : Local Combo Match")
     local_combos = search_combos(

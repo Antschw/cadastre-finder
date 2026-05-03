@@ -10,11 +10,14 @@ Usage CLI : cadastre-finder build-parcel-adjacency [--dept 61] [--workers 8]
 from __future__ import annotations
 
 import os
+import queue
+import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import duckdb
 import numpy as np
+import pandas as pd
 from loguru import logger
 from shapely import simplify
 from shapely.strtree import STRtree
@@ -24,7 +27,8 @@ from tqdm import tqdm
 from cadastre_finder.config import DB_PATH
 
 _CHECKPOINT_EVERY = 1000
-_BATCH_INSERT = 50_000
+_FLUSH_EVERY_PAIRS = 200_000   # ~10 Mo de DataFrame, ~0.1 s d'INSERT côté DuckDB
+_QUEUE_MAXSIZE = 64            # backpressure : ~600 k paires en attente max
 _LOAD_BATCH = 500       # communes chargées par requête SQL (évite un IN() trop long)
 _COMPUTE_BATCH = 200    # communes traitées par lot (contrôle l'empreinte mémoire)
 # Buffer en degrés WGS84 pour combler les micro-gaps cadastraux (~1 m à 47°N)
@@ -32,6 +36,91 @@ _BUFFER_DEG = 0.000009
 # Tolérance de simplification Douglas-Peucker (~11 cm en WGS84) — sans impact
 # sémantique pour de l'adjacence à 1 m, élimine 70-90 % des sommets de bruit.
 _SIMPLIFY_TOL = 1e-6
+
+
+class _AdjacencyWriter:
+    """Thread d'écriture : découple les INSERT DuckDB du chemin critique main.
+
+    Le main pousse des batches de paires via `submit()` ; un thread interne
+    accumule en RAM jusqu'à `flush_every_pairs` puis fait un `INSERT INTO ...
+    SELECT * FROM df` (50× plus rapide que `executemany`). Le CHECKPOINT est
+    déclenché par le writer toutes les `checkpoint_every_communes` communes.
+    """
+
+    def __init__(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        flush_every_pairs: int = _FLUSH_EVERY_PAIRS,
+        queue_maxsize: int = _QUEUE_MAXSIZE,
+        checkpoint_every_communes: int = _CHECKPOINT_EVERY,
+    ) -> None:
+        self._con = con
+        self._q: queue.Queue[list[tuple[str, str]] | None] = queue.Queue(maxsize=queue_maxsize)
+        self._buf: list[tuple[str, str]] = []
+        self._flush_threshold = flush_every_pairs
+        self._ckpt_every = checkpoint_every_communes
+        self._communes_since_ckpt = 0
+        self.total_pairs_inserted = 0
+        self.error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, name="adj-writer", daemon=False)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(self, pairs: list[tuple[str, str]]) -> None:
+        if self.error is not None:
+            raise self.error
+        # `put` bloque si la queue est pleine → backpressure naturelle sur le main.
+        self._q.put(pairs)
+
+    def stop_and_join(self, timeout: float = 600) -> None:
+        # Sentinelle de fin : déclenche le flush résiduel + checkpoint final.
+        self._q.put(None)
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise RuntimeError("[parcel_adj] writer hang (timeout)")
+        if self.error is not None:
+            raise self.error
+
+    def _flush(self, do_checkpoint: bool) -> None:
+        if self._buf:
+            df = pd.DataFrame(self._buf, columns=["id_a", "id_b"])
+            self._con.register("_padj_stage", df)
+            try:
+                self._con.execute(
+                    "INSERT INTO parcelles_adjacency SELECT id_a, id_b FROM _padj_stage"
+                )
+            finally:
+                self._con.unregister("_padj_stage")
+            self.total_pairs_inserted += len(self._buf)
+            self._buf.clear()
+        if do_checkpoint:
+            self._con.execute("CHECKPOINT")
+            self._communes_since_ckpt = 0
+
+    def _run(self) -> None:
+        try:
+            while True:
+                item = self._q.get()
+                if item is None:
+                    self._flush(do_checkpoint=False)
+                    if self._communes_since_ckpt > 0:
+                        self._con.execute("CHECKPOINT")
+                    return
+                self._buf.extend(item)
+                self._communes_since_ckpt += 1
+                if len(self._buf) >= self._flush_threshold:
+                    self._flush(do_checkpoint=False)
+                if self._communes_since_ckpt >= self._ckpt_every:
+                    self._flush(do_checkpoint=True)
+        except BaseException as e:
+            self.error = e
+            # Vide la queue pour ne pas bloquer le main sur un `put` saturé.
+            try:
+                while True:
+                    self._q.get_nowait()
+            except queue.Empty:
+                pass
 
 
 def build_parcel_adjacency(
@@ -56,16 +145,22 @@ def build_parcel_adjacency(
         con.execute("INSTALL spatial; LOAD spatial;")
         _ensure_table(con)
 
-        all_communes = _list_target_communes(con, departments, communes)
+        # Cursor thread-local DuckDB : le main lit via `read_cur` pendant que le
+        # writer écrit via `con`. DuckDB sérialise les `execute()` en interne →
+        # pas besoin de Lock Python explicite.
+        read_cur = con.cursor()
+        read_cur.execute("LOAD spatial;")
+
+        all_communes = _list_target_communes(read_cur, departments, communes)
         if not all_communes:
             logger.warning("[parcel_adj] Aucune commune cible.")
             return
 
         if force:
-            _delete_existing(con, all_communes)
+            _delete_existing(read_cur, all_communes)
             todo = all_communes
         else:
-            already = _list_already_done(con)
+            already = _list_already_done(read_cur)
             todo = [c for c in all_communes if c not in already]
 
         logger.info(
@@ -87,6 +182,15 @@ def build_parcel_adjacency(
         con.execute("DROP INDEX IF EXISTS idx_parcel_adj_a")
         con.execute("DROP INDEX IF EXISTS idx_parcel_adj_b")
 
+        n_db_before = con.execute("SELECT COUNT(*) FROM parcelles_adjacency").fetchone()[0]
+
+        # Découple les inserts du chemin critique main thread : sans ça, le main
+        # bloque ~3 s par commune sur `executemany` et le pool de 31 workers reste
+        # massivement sous-saturé. Le writer flushe par batch DataFrame (~50× plus
+        # rapide que `executemany`) et déclenche les CHECKPOINT.
+        writer = _AdjacencyWriter(con)
+        writer.start()
+
         try:
             # Le pool est créé UNE SEULE FOIS : sur Windows (spawn), chaque création
             # du pool engendre N nouveaux processus Python (~5-10 s chacun). Recréer
@@ -98,7 +202,7 @@ def build_parcel_adjacency(
 
                         # Charge uniquement ce lot en WKB binaire (50 % plus compact que GeoJSON,
                         # parsing ~5× plus rapide dans les workers)
-                        commune_data = _load_commune_geometries_wkb(con, batch_codes)
+                        commune_data = _load_commune_geometries_wkb(read_cur, batch_codes)
 
                         tasks = [
                             (code, commune_data.get(code, []))
@@ -120,26 +224,33 @@ def build_parcel_adjacency(
                                 continue
 
                             if pairs:
-                                _bulk_insert(con, pairs)
+                                writer.submit(pairs)
                                 total_pairs += len(pairs)
                             completed += 1
                             pbar.update(1)
                             pbar.set_postfix(pairs=f"{total_pairs:,}")
 
-                            # CHECKPOINT espacé : sur une table qui grossit, chaque
-                            # checkpoint flush tout le WAL → coût croissant. Cause
-                            # principale du ralentissement progressif observé.
-                            if completed % _CHECKPOINT_EVERY == 0:
-                                con.execute("CHECKPOINT")
-
                         del commune_data  # libère la mémoire du lot avant le suivant
         finally:
-            logger.info("[parcel_adj] Reconstruction des index secondaires")
-            con.execute("CREATE INDEX IF NOT EXISTS idx_parcel_adj_a ON parcelles_adjacency (id_a)")
-            con.execute("CREATE INDEX IF NOT EXISTS idx_parcel_adj_b ON parcelles_adjacency (id_b)")
-            con.execute("CHECKPOINT")
+            try:
+                writer.stop_and_join(timeout=600)
+            finally:
+                logger.info("[parcel_adj] Reconstruction des index secondaires")
+                con.execute("CREATE INDEX IF NOT EXISTS idx_parcel_adj_a ON parcelles_adjacency (id_a)")
+                con.execute("CREATE INDEX IF NOT EXISTS idx_parcel_adj_b ON parcelles_adjacency (id_b)")
+                con.execute("CHECKPOINT")
 
-        logger.info(f"[parcel_adj] Terminé : {total_pairs:,} paires sur {completed} communes.")
+        n_db_after = con.execute("SELECT COUNT(*) FROM parcelles_adjacency").fetchone()[0]
+        delta_db = n_db_after - n_db_before
+        logger.info(
+            f"[parcel_adj] Terminé : {writer.total_pairs_inserted:,} paires écrites "
+            f"par le writer (+{delta_db:,} en table) sur {completed} communes."
+        )
+        if writer.total_pairs_inserted != delta_db:
+            logger.warning(
+                f"[parcel_adj] Mismatch : writer={writer.total_pairs_inserted:,} vs "
+                f"DB delta={delta_db:,}. Possible perte de paires."
+            )
     finally:
         con.close()
 
@@ -264,17 +375,6 @@ def _delete_existing(con: duckdb.DuckDBPyConnection, codes: list[str]) -> None:
                OR id_b IN (SELECT id FROM parcelles WHERE code_insee IN ({placeholders}))""",
         codes + codes,
     )
-
-
-def _bulk_insert(con: duckdb.DuckDBPyConnection, pairs: list[tuple[str, str]]) -> None:
-    if not pairs:
-        return
-    # Sans PRIMARY KEY ni index pendant l'ingest, INSERT brut est ~10× plus
-    # rapide que INSERT OR IGNORE. Les paires sont uniques par construction
-    # (set par worker + parcelle mono-commune + _delete_existing si --force).
-    for start in range(0, len(pairs), _BATCH_INSERT):
-        batch = pairs[start : start + _BATCH_INSERT]
-        con.executemany("INSERT INTO parcelles_adjacency VALUES (?, ?)", batch)
 
 
 # ---------------------------------------------------------------------------

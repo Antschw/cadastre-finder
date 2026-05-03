@@ -44,10 +44,10 @@ def search_dpe(
             return []
 
         query = f"""
-            SELECT 
-                adresse_brute, code_postal_brut, nom_commune_brut,
+            SELECT
+                adresse_brut, code_postal_brut, nom_commune_brut,
                 surface_habitable_logement, etiquette_dpe, etiquette_ges,
-                date_établissement_dpe
+                date_etablissement_dpe
             FROM {DPE_TABLE}
             WHERE code_insee_ban = ?
               AND surface_habitable_logement BETWEEN ? AND ?
@@ -61,7 +61,7 @@ def search_dpe(
             query += " AND etiquette_ges = ?"
             params.append(ges_label)
 
-        query += " ORDER BY date_établissement_dpe DESC LIMIT 10"
+        query += " ORDER BY date_etablissement_dpe DESC LIMIT 10"
         
         rows = con.execute(query, params).fetchall()
         

@@ -23,10 +23,12 @@ def filter_built_parcels(
 
     try:
         # On calcule la surface bâtie totale pour chaque parcelle (intersection)
+        # On se restreint aux osm_type = 'area' (polygones) pour avoir une surface réelle
         rows = con.execute(f"""
             SELECT p.id, SUM(ST_Area(ST_Transform(ST_Intersection(b.geometry, p.geometry), 'EPSG:4326', 'EPSG:2154'))) as built_area
             FROM parcelles p, buildings b
             WHERE p.id IN ({placeholders})
+              AND b.osm_type = 'area'
               AND ST_Intersects(b.geometry, p.geometry)
             GROUP BY p.id
         """, ids).fetchall()
@@ -46,10 +48,10 @@ def filter_built_parcels(
 
     if not filtered and matches:
         logger.warning(
-            "[building_filter] Aucune parcelle bâtie trouvée — données bâtiments manquantes "
-            "pour cette zone. Filtre désactivé."
+            f"[building_filter] Aucun bâtiment trouvé sur les {len(matches)} parcelles candidates. "
+            "Filtre désactivé par sécurité."
         )
-        # On marque built_area comme -1 pour signaler l'absence de données
+        # On marque built_area comme -1 pour signaler l'absence de résultats bâtis
         for m in matches:
             m.built_area = -1.0
         return matches
@@ -68,6 +70,7 @@ def get_built_area(parcel_id: str, con: duckdb.DuckDBPyConnection) -> float:
             SELECT SUM(ST_Area(ST_Transform(ST_Intersection(b.geometry, p.geometry), 'EPSG:4326', 'EPSG:2154')))
             FROM parcelles p, buildings b
             WHERE p.id = ?
+              AND b.osm_type = 'area'
               AND ST_Intersects(b.geometry, p.geometry)
         """, [parcel_id]).fetchone()
         return row[0] if row and row[0] is not None else 0.0
@@ -117,7 +120,8 @@ def filter_built_combos(
             WHERE p.id IN ({placeholders})
               AND EXISTS (
                   SELECT 1 FROM buildings b
-                  WHERE ST_Intersects(b.geometry, p.geometry)
+                  WHERE b.osm_type = 'area'
+                    AND ST_Intersects(b.geometry, p.geometry)
               )
         """, all_ids).fetchall()
     except Exception as e:

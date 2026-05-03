@@ -26,6 +26,7 @@ _BATCH_INSERT = 10_000  # paires par executemany
 def build_adjacency_table(
     db_path: Path = DB_PATH,
     include_rank2: bool = True,
+    force: bool = False,
 ) -> None:
     """Construit la table `communes_adjacency` (code_insee_a, code_insee_b, rang).
 
@@ -42,18 +43,22 @@ def build_adjacency_table(
         if count == 0:
             raise RuntimeError("La table communes est vide. Lancez d'abord l'ingestion cadastre.")
 
-        # Idempotence : skip si déjà construit
+        # Idempotence : skip si déjà construit (sauf --force)
         existing = con.execute(
             "SELECT COUNT(*) FROM information_schema.tables "
             "WHERE table_name = 'communes_adjacency'"
         ).fetchone()[0]
         if existing > 0:
-            n = con.execute(
-                "SELECT COUNT(*) FROM communes_adjacency WHERE rang = 1"
-            ).fetchone()[0]
-            if n > 0:
-                logger.info(f"Table d'adjacence déjà construite ({n} paires rang 1). Skip.")
-                return
+            if force:
+                logger.info("[adjacency] --force : suppression de communes_adjacency pour recalcul.")
+                con.execute("DROP TABLE communes_adjacency")
+            else:
+                n = con.execute(
+                    "SELECT COUNT(*) FROM communes_adjacency WHERE rang = 1"
+                ).fetchone()[0]
+                if n > 0:
+                    logger.info(f"Table d'adjacence déjà construite ({n} paires rang 1). Skip.")
+                    return
 
         # --- Chargement des géométries ---
         logger.info(f"Chargement de {count} communes depuis DuckDB...")
