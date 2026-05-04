@@ -52,6 +52,7 @@ def search_dpe(
 
     con = duckdb.connect(str(db_path), read_only=True)
     try:
+        con.execute("LOAD spatial;")
         table_exists = con.execute(
             f"SELECT count(*) FROM information_schema.tables WHERE table_name = '{DPE_TABLE}'"
         ).fetchone()[0]
@@ -59,7 +60,8 @@ def search_dpe(
             logger.warning(f"Table {DPE_TABLE} absente. Lancez l'ingestion DPE.")
             return []
 
-        # On tente plusieurs niveaux de relâchement si aucun résultat
+        all_rows = []
+        # On tente plusieurs niveaux de relâchement
         for attempt in range(4):
             placeholders = ", ".join("?" * len(insee_codes))
             query = f"""
@@ -102,8 +104,21 @@ def search_dpe(
             if rows:
                 if attempt > 0:
                     logger.debug(f"[dpe_match] Résultats trouvés après relâchement (essai {attempt+1}).")
-                break
-        else:
+                
+                # Ajouter les nouveaux uniquement pour éviter les doublons
+                new_added = 0
+                for r in rows:
+                    if r not in all_rows:
+                        all_rows.append(r)
+                        new_added += 1
+                
+                # Si on a trouvé des nouveaux résultats, on vérifie si on en a assez
+                # On veut au moins 5 records pour avoir un choix si possible,
+                # sauf si on est déjà au stade le plus relâché.
+                if len(all_rows) >= 5 or (attempt >= 1 and new_added == 0):
+                    break
+        
+        if not all_rows:
             return []
 
         return [
@@ -117,7 +132,7 @@ def search_dpe(
                 "ges": r[6],
                 "date": r[7],
             }
-            for r in rows
+            for r in all_rows
         ]
     except Exception as e:
         logger.error(f"[dpe_match] Erreur lors de la recherche DPE : {e}")
@@ -129,6 +144,90 @@ def search_dpe(
 # ---------------------------------------------------------------------------
 # Localisation parcelle pour un enregistrement DPE
 # ---------------------------------------------------------------------------
+
+def _fetch_best_anchor(
+    con: duckdb.DuckDBPyConnection,
+    lat: float,
+    lon: float,
+    dpe_record: dict,
+) -> Optional[ParcelMatch]:
+    """Cherche la meilleure parcelle ancre aux coordonnées données.
+
+    1. Cherche les parcelles dans un rayon de 25m.
+    2. Si une parcelle intersecte le point et fait > 50m2, on la prend.
+    3. Sinon, on prend la parcelle de > 50m2 la plus proche (< 15m).
+    4. En dernier recours, utilise l'API reverse geocoding de la Géoplateforme.
+    """
+    insee = dpe_record.get("code_insee")
+    # Buffer de ~40m pour le filtrage spatial initial (0.0004 deg)
+    rows = con.execute("""
+        SELECT id, code_insee, contenance,
+               ST_X(ST_Centroid(geometry)) AS lon,
+               ST_Y(ST_Centroid(geometry)) AS lat,
+               ST_AsGeoJSON(geometry)      AS geojson,
+               ST_Distance(
+                   ST_Transform(ST_FlipCoordinates(ST_Point(?, ?)), 'EPSG:4326', 'EPSG:2154'),
+                   ST_Transform(ST_FlipCoordinates(geometry), 'EPSG:4326', 'EPSG:2154')
+               ) as dist
+        FROM parcelles
+        WHERE ST_Intersects(geometry, ST_Buffer(ST_Point(?, ?), 0.0004))
+          AND (code_insee = ? OR ? IS NULL)
+        ORDER BY dist
+        LIMIT 10
+    """, [lon, lat, lon, lat, insee, insee]).fetchall()
+
+    exact_match = None
+    if rows:
+        for r in rows:
+            if r[6] <= 0.00001:  # Quasi-intersection
+                exact_match = r
+                break
+        
+        # Si intersection sur une parcelle non-minuscule
+        if exact_match and exact_match[2] >= 50:
+            return _row_to_parcel_match(con, exact_match, dpe_record)
+
+        # Chercher une parcelle raisonnable (> 50m2) très proche (< 15m)
+        for r in rows:
+            if r[2] >= 50 and r[6] < 15:
+                return _row_to_parcel_match(con, r, dpe_record)
+
+    # Fallback API
+    logger.debug(f"[dpe_match] Pas d'ancre locale idéale pour ({lat}, {lon}), appel API...")
+    parcel_id = reverse_geocode_parcel(lat, lon)
+    if parcel_id:
+        anchor = _fetch_parcel_by_id(con, parcel_id, dpe_record)
+        if anchor:
+            return anchor
+
+    # Dernier recours : l'exact match même si petit, ou la plus proche
+    if exact_match:
+        return _row_to_parcel_match(con, exact_match, dpe_record)
+    if rows:
+        return _row_to_parcel_match(con, rows[0], dpe_record)
+
+    return None
+
+
+def _row_to_parcel_match(con: duckdb.DuckDBPyConnection, row: tuple, dpe_record: dict) -> ParcelMatch:
+    nom_row = con.execute(
+        "SELECT nom FROM communes WHERE code_insee = ?", [row[1]]
+    ).fetchone()
+    nom_commune = nom_row[0] if nom_row else row[1]
+
+    return ParcelMatch(
+        id_parcelle=row[0],
+        code_insee=row[1],
+        nom_commune=nom_commune,
+        contenance=row[2],
+        centroid_lon=row[3],
+        centroid_lat=row[4],
+        geometry_geojson=row[5] or "{}",
+        score=0.0,
+        dpe_label=dpe_record.get("dpe"),
+        ges_label=dpe_record.get("ges"),
+    )
+
 
 def _fetch_parcel_by_id(
     con: duckdb.DuckDBPyConnection,
@@ -350,10 +449,10 @@ def _aggregate_around(
     target_terrain: float,
     tolerance_pct: float,
     dpe_record: dict,
-) -> Optional[ComboMatch]:
-    """BFS local autour d'une parcelle ancre, cherche le combo le plus proche de la cible.
+) -> list[ComboMatch]:
+    """BFS local autour d'une parcelle ancre, cherche les combos proches de la cible.
 
-    Retourne `None` si aucune combinaison de 2-6 parcelles n'atteint la fenêtre.
+    Retourne une liste de ComboMatch triée par proximité à la cible.
     """
     delta = target_terrain * tolerance_pct / 100.0
     lo, hi = target_terrain - delta, target_terrain + delta
@@ -361,7 +460,7 @@ def _aggregate_around(
     # Frontière initiale : voisins directs de l'ancre
     initial_neighbors = _fetch_neighbor_ids(con, anchor.id_parcelle)
     if not initial_neighbors:
-        return None
+        return []
 
     # On hydrate l'ancre + voisins de niveau 1 dans un seul aller-retour
     visited_ids: set[str] = {anchor.id_parcelle, *initial_neighbors}
@@ -370,31 +469,27 @@ def _aggregate_around(
         parcels_cache[anchor.id_parcelle] = anchor
 
     neighbors_cache: dict[str, list[str]] = {anchor.id_parcelle: initial_neighbors}
-    best_combo: Optional[list[ParcelMatch]] = None
-    best_delta: float = float("inf")
+    
+    # On garde les N meilleurs combos uniques
+    found_combos: dict[frozenset[str], tuple[float, list[ParcelMatch]]] = {}
     nodes = 0
 
     def dfs(current: list[ParcelMatch], total: float, frontier: list[str]) -> None:
-        nonlocal best_combo, best_delta, nodes
+        nonlocal nodes
         nodes += 1
         if nodes > _MAX_BFS_NODES:
             return
 
         if len(current) >= 2 and lo <= total <= hi:
+            ids = frozenset(p.id_parcelle for p in current)
             d = abs(total - target_terrain)
-            if d < best_delta:
-                best_delta = d
-                best_combo = list(current)
-                logger.debug(f"[dpe_match] Nouveau meilleur combo : {total}m2 (delta {d})")
-                if d <= target_terrain * 0.01:  # Match très proche trouvé (1%)
-                    return
+            if ids not in found_combos or d < found_combos[ids][0]:
+                found_combos[ids] = (d, list(current))
+                logger.debug(f"[dpe_match] Combo trouvé : {total}m2 (delta {d})")
 
         if total >= hi or len(current) >= _MAX_AGGREGATE_PARTS:
             return
 
-        # Trier la frontière par surface décroissante (heuristique sac à dos / convergence)
-        # On favorise les parcelles qui nous rapprochent le plus de la cible.
-        
         # S'assurer que tous les IDs de la frontière sont dans le cache
         missing = [pid for pid in frontier if pid not in parcels_cache]
         if missing:
@@ -406,8 +501,7 @@ def _aggregate_around(
             if p:
                 candidates.append(p)
         
-        # Heuristique : on trie pour prendre les plus grandes d'abord (greedy)
-        # ou celles qui complètent le mieux la surface restante.
+        # Heuristique : on trie par proximité à la surface restante
         remaining = target_terrain - total
         candidates.sort(key=lambda x: abs(x.contenance - remaining))
 
@@ -418,7 +512,6 @@ def _aggregate_around(
             if new_total > hi:
                 continue
 
-            # Récupérer voisins via cache
             if p.id_parcelle not in neighbors_cache:
                 neighbors_cache[p.id_parcelle] = _fetch_neighbor_ids(con, p.id_parcelle)
             
@@ -432,19 +525,24 @@ def _aggregate_around(
                 {*frontier, *nbr_ids} - current_ids - {p.id_parcelle}
             )
             dfs(current + [p], new_total, new_frontier)
-            if best_delta == 0:  # Sortie précoce si match parfait
-                return
 
     dfs([anchor], anchor.contenance, initial_neighbors)
 
-    if best_combo is None:
-        return None
+    if not found_combos:
+        return []
     
-    # Hydrater complètement les parcelles du best_combo avant de construire le ComboMatch
-    full_parcels = _fetch_parcels_bulk(con, [p.id_parcelle for p in best_combo])
-    hydrated_parts = [full_parcels[p.id_parcelle] for p in best_combo if p.id_parcelle in full_parcels]
+    # Trier par delta et prendre les 10 meilleurs (pour laisser du choix à l'orchestration finale)
+    sorted_candidates = sorted(found_combos.values(), key=lambda x: x[0])[:10]
     
-    return _build_combo_from_parts(hydrated_parts, dpe_record)
+    results = []
+    for d, parts in sorted_candidates:
+        # Hydrater complètement les parcelles
+        full_parcels = _fetch_parcels_bulk(con, [p.id_parcelle for p in parts])
+        hydrated_parts = [full_parcels[p.id_parcelle] for p in parts if p.id_parcelle in full_parcels]
+        if hydrated_parts:
+            results.append(_build_combo_from_parts(hydrated_parts, dpe_record))
+    
+    return results
 
 
 def find_parcel_for_dpe_record(
@@ -452,14 +550,10 @@ def find_parcel_for_dpe_record(
     target_terrain: Optional[float],
     tolerance_pct: float = 5.0,
     db_path: Path = DB_PATH,
-) -> Optional[Union[ParcelMatch, ComboMatch]]:
+) -> list[Union[ParcelMatch, ComboMatch]]:
     """Localise une parcelle (ou agrégat) pour un enregistrement DPE.
 
-    1. Géocode l'adresse via la Géoplateforme.
-    2. Cherche la parcelle locale qui contient ce point (`ST_Intersects`).
-    3. Si la parcelle trouvée est trop petite vs `target_terrain` (hors tolérance basse),
-       tente une agrégation BFS sur ses voisines.
-    4. Si aucune parcelle locale, fallback `/reverse` Géoplateforme + lookup par id.
+    Retourne une liste de candidats.
     """
     full_address = f"{dpe_record['address']}, {dpe_record['postcode']} {dpe_record['city']}"
     coords = geocode_address(
@@ -469,36 +563,26 @@ def find_parcel_for_dpe_record(
         citycode=dpe_record.get("code_insee"),
     )
     if not coords:
-        return None
+        return []
     lat, lon = coords
 
     con = duckdb.connect(str(db_path), read_only=True)
     try:
         con.execute("LOAD spatial;")
 
-        anchor = _fetch_parcel_at_point(con, lat, lon, dpe_record)
+        anchor = _fetch_best_anchor(con, lat, lon, dpe_record)
         if anchor is None:
-            # Fallback : Géoplateforme reverse parcel pour récupérer un id officiel
-            logger.debug(
-                f"[dpe_match] Pas de parcelle locale pour ({lat}, {lon}), "
-                "essai reverse geocoding API..."
-            )
-            parcel_id = reverse_geocode_parcel(lat, lon)
-            if not parcel_id:
-                return None
-            anchor = _fetch_parcel_by_id(con, parcel_id, dpe_record)
-            if anchor is None:
-                return None
+            return []
 
         if target_terrain is None:
-            return anchor
+            return [anchor]
 
         delta = target_terrain * tolerance_pct / 100.0
         lo, hi = target_terrain - delta, target_terrain + delta
 
-        # Parcelle ancre déjà dans la fenêtre cible → on la prend telle quelle
+        # Parcelle ancre déjà dans la fenêtre cible
         if lo <= anchor.contenance <= hi:
-            return anchor
+            return [anchor]
 
         # Parcelle ancre plus petite → tenter agrégation
         if anchor.contenance < lo:
@@ -510,24 +594,21 @@ def find_parcel_for_dpe_record(
                 elif attempt == 2:
                     current_tol = max(tolerance_pct, 15.0) # min 15%
 
-                combo = _aggregate_around(con, anchor, target_terrain, current_tol, dpe_record)
-                if combo is not None:
+                combos = _aggregate_around(con, anchor, target_terrain, current_tol, dpe_record)
+                if combos:
                     logger.debug(
-                        f"[dpe_match] Combo trouvé pour {target_terrain}m2 "
-                        f"(trouvé: {combo.total_contenance}m2, tol: {current_tol}%, essai: {attempt+1})"
+                        f"[dpe_match] {len(combos)} combo(s) trouvé(s) pour {target_terrain}m2 "
+                        f"(essai: {attempt+1})"
                     )
-                    return combo
+                    return combos
 
-                # Si on n'a rien trouvé même avec 15% de tolérance, on s'arrête
                 if attempt == 2:
                     break
 
-        # Parcelle plus grande que la cible (ou agrégation infructueuse)
-        # → on retourne l'ancre quand même ; les filtres durs trancheront.
-        return anchor
+        return [anchor]
     except Exception as e:
         logger.error(f"[dpe_match] Erreur localisation DPE : {e}")
-        return None
+        return []
     finally:
         con.close()
 
@@ -564,17 +645,16 @@ def dpe_led_search(
     matches: list[Union[ParcelMatch, ComboMatch]] = []
     seen_ids: set[frozenset[str]] = set()
     for rec in records:
-        m = find_parcel_for_dpe_record(rec, target_terrain, tolerance_pct, db_path=db_path)
-        if m is None:
-            continue
-        ids = (
-            frozenset([m.id_parcelle]) if isinstance(m, ParcelMatch)
-            else frozenset(m.ids)
-        )
-        if ids in seen_ids:
-            continue
-        seen_ids.add(ids)
-        matches.append(m)
+        rec_matches = find_parcel_for_dpe_record(rec, target_terrain, tolerance_pct, db_path=db_path)
+        for m in rec_matches:
+            ids = (
+                frozenset([m.id_parcelle]) if isinstance(m, ParcelMatch)
+                else frozenset(m.ids)
+            )
+            if ids in seen_ids:
+                continue
+            seen_ids.add(ids)
+            matches.append(m)
 
     logger.info(f"[dpe_match] {len(matches)} parcelle(s)/combo(s) localisé(s) via DPE.")
     return matches
