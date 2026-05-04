@@ -187,6 +187,8 @@ class _BatchGeomHandler(osmium.SimpleHandler):
         self._buf.clear()
 
     def node(self, n) -> None:
+        if not n.tags:
+            return
         try:
             wkt = self._wktfab.create_point(n)
             self._append(n.id, "node", {k: v for k, v in n.tags}, wkt)
@@ -194,6 +196,12 @@ class _BatchGeomHandler(osmium.SimpleHandler):
             pass
 
     def way(self, w) -> None:
+        if not w.tags:
+            return
+        # Pour les bâtiments, on préfère area() qui crée des polygones.
+        # Les ways de bâtiments seraient des LINESTRING fermés, moins utiles pour ST_Area.
+        if "building" in w.tags:
+            return
         try:
             wkt = self._wktfab.create_linestring(w)
             self._append(w.id, "way", {k: v for k, v in w.tags}, wkt)

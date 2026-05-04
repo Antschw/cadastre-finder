@@ -98,6 +98,7 @@ def cmd_build_adjacency(args: argparse.Namespace) -> int:
     build_adjacency_table(
         db_path=Path(args.db),
         include_rank2=not args.no_rank2,
+        force=args.force,
     )
     return 0
 
@@ -119,14 +120,23 @@ def cmd_build_parcel_adjacency(args: argparse.Namespace) -> int:
 
 def cmd_search(args: argparse.Namespace) -> int:
     from cadastre_finder.search.orchestrator import search_orchestrated, search_from_text
+    from cadastre_finder.search.models import NeighborMode
     from cadastre_finder.out.map import render_results
 
     db_path = Path(args.db)
-    
+
+    # Résolution du périmètre voisinage
+    neighbor_mode = NeighborMode(args.neighbors)
+    if getattr(args, "rank2", False) and neighbor_mode is NeighborMode.NONE:
+        logger.warning("[cli] --rank2 est déprécié, utilisez --neighbors rank2.")
+        neighbor_mode = NeighborMode.RANK2
+
     if args.text:
         logger.info("=== Recherche orchestrée depuis le texte de l'annonce ===")
-        all_results = search_from_text(args.text, commune_hint=args.commune, db_path=db_path)
-        # Extraction pour affichage
+        all_results = search_from_text(
+            args.text, commune_hint=args.commune,
+            neighbor_mode=neighbor_mode, db_path=db_path,
+        )
         from cadastre_finder.search.ad_parser import parse_ad_text
         criteria = parse_ad_text(args.text)
         commune = args.commune or criteria.commune or "Inconnue"
@@ -138,9 +148,13 @@ def cmd_search(args: argparse.Namespace) -> int:
         all_results = search_orchestrated(
             commune=commune,
             surface_m2=surface,
+            living_surface=getattr(args, "living_surface", None),
+            dpe_label=getattr(args, "dpe", None),
+            ges_label=getattr(args, "ges", None),
             postal_code=getattr(args, "postal", None),
             tolerance_pct=args.tolerance,
-            db_path=db_path
+            neighbor_mode=neighbor_mode,
+            db_path=db_path,
         )
 
     if not all_results:
@@ -305,6 +319,7 @@ def main() -> None:
     # build-adjacency
     p_adj = sub.add_parser("build-adjacency", help="Calcul table d'adjacence communes")
     p_adj.add_argument("--no-rank2", action="store_true", help="Ne pas calculer le rang 2")
+    p_adj.add_argument("--force", action="store_true", help="Supprimer et reconstruire même si déjà présent")
     p_adj.set_defaults(func=cmd_build_adjacency)
 
     # build-parcel-adjacency
@@ -316,13 +331,24 @@ def main() -> None:
     p_padj.set_defaults(func=cmd_build_parcel_adjacency)
 
     # search
-    p_search = sub.add_parser("search", help="Recherche orchestrée (Phase 1-4)")
+    p_search = sub.add_parser("search", help="Recherche orchestrée (DPE-led ou combo)")
     p_search.add_argument("--commune", help="Nom de la commune annoncée")
-    p_search.add_argument("--surface", type=float, help="Surface en m²")
+    p_search.add_argument("--surface", type=float, help="Surface terrain en m²")
+    p_search.add_argument("--living-surface", type=float, dest="living_surface",
+                          help="Surface habitable en m² (utilisée par la recherche DPE)")
+    p_search.add_argument("--dpe", choices=["A", "B", "C", "D", "E", "F", "G"],
+                          help="Étiquette DPE (déclenche la recherche pilotée par l'ADEME)")
+    p_search.add_argument("--ges", choices=["A", "B", "C", "D", "E", "F", "G"],
+                          help="Étiquette GES (déclenche la recherche pilotée par l'ADEME)")
     p_search.add_argument("--text", help="Texte de l'annonce immobilière (extraction auto)")
     p_search.add_argument("--postal", help="Code postal (optionnel, pour désambiguïser)")
     p_search.add_argument("--tolerance", type=float, default=5.0, help="Tolérance surface en pourcent")
-    p_search.add_argument("--rank2", action="store_true", help="Inclure voisines rang 2")
+    p_search.add_argument(
+        "--neighbors", choices=["none", "rank1", "rank2"], default="none",
+        help="Étendre aux communes voisines (rang 1 ou 2). Défaut : commune principale uniquement.",
+    )
+    p_search.add_argument("--rank2", action="store_true",
+                          help="(Déprécié) alias de --neighbors rank2")
     p_search.add_argument("--no-combo", action="store_true", help="Désactiver la recherche de combos")
     p_search.add_argument("--max-parts", type=int, default=6, choices=[2, 3, 4, 5, 6], help="Taille max des combos (défaut : 6)")
     p_search.add_argument("--include-agricultural", action="store_true", help="Inclure les parcelles sans bâtiment (agricoles)")

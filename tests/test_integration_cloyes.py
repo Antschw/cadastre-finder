@@ -108,7 +108,7 @@ def test_cloyes_dfs_finds_combo(pipeline_ctx):
     from cadastre_finder.search.combo_match import _find_combos_dfs
 
     candidates, graph = pipeline_ctx
-    combos = _find_combos_dfs(candidates, graph, SURFACE_CIBLE, TOLERANCE_PCT, 6, top_n=3000, min_compactness=0.15)
+    combos = _find_combos_dfs(candidates, graph, SURFACE_CIBLE, TOLERANCE_PCT, 6, top_n=3000)
     ids_par_combo = [frozenset(c.ids) for c in combos]
     assert PARCELLES_ATTENDUES in ids_par_combo, (
         f"Combo {sorted(PARCELLES_ATTENDUES)} non trouvé dans le DFS (top_n=3000).\n"
@@ -122,7 +122,7 @@ def test_cloyes_combo_surface(pipeline_ctx):
     from cadastre_finder.search.combo_match import _find_combos_dfs
 
     candidates, graph = pipeline_ctx
-    combos = _find_combos_dfs(candidates, graph, SURFACE_CIBLE, TOLERANCE_PCT, 6, top_n=3000, min_compactness=0.15)
+    combos = _find_combos_dfs(candidates, graph, SURFACE_CIBLE, TOLERANCE_PCT, 6, top_n=3000)
     for c in combos:
         if frozenset(c.ids) == PARCELLES_ATTENDUES:
             assert c.total_contenance == SURFACE_REELLE, (

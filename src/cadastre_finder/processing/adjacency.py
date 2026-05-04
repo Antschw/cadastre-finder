@@ -18,6 +18,7 @@ from shapely.strtree import STRtree
 from tqdm import tqdm
 
 from cadastre_finder.config import DB_PATH
+from cadastre_finder.search.models import NeighborMode
 
 _BUFFER_DEG = 0.00001   # ≈ 1 m à la latitude de la France
 _BATCH_INSERT = 10_000  # paires par executemany
@@ -26,6 +27,7 @@ _BATCH_INSERT = 10_000  # paires par executemany
 def build_adjacency_table(
     db_path: Path = DB_PATH,
     include_rank2: bool = True,
+    force: bool = False,
 ) -> None:
     """Construit la table `communes_adjacency` (code_insee_a, code_insee_b, rang).
 
@@ -42,18 +44,22 @@ def build_adjacency_table(
         if count == 0:
             raise RuntimeError("La table communes est vide. Lancez d'abord l'ingestion cadastre.")
 
-        # Idempotence : skip si déjà construit
+        # Idempotence : skip si déjà construit (sauf --force)
         existing = con.execute(
             "SELECT COUNT(*) FROM information_schema.tables "
             "WHERE table_name = 'communes_adjacency'"
         ).fetchone()[0]
         if existing > 0:
-            n = con.execute(
-                "SELECT COUNT(*) FROM communes_adjacency WHERE rang = 1"
-            ).fetchone()[0]
-            if n > 0:
-                logger.info(f"Table d'adjacence déjà construite ({n} paires rang 1). Skip.")
-                return
+            if force:
+                logger.info("[adjacency] --force : suppression de communes_adjacency pour recalcul.")
+                con.execute("DROP TABLE communes_adjacency")
+            else:
+                n = con.execute(
+                    "SELECT COUNT(*) FROM communes_adjacency WHERE rang = 1"
+                ).fetchone()[0]
+                if n > 0:
+                    logger.info(f"Table d'adjacence déjà construite ({n} paires rang 1). Skip.")
+                    return
 
         # --- Chargement des géométries ---
         logger.info(f"Chargement de {count} communes depuis DuckDB...")
@@ -198,6 +204,37 @@ def get_neighbors(
         return [r[0] for r in rows]
     finally:
         con.close()
+
+
+def resolve_insee_scope(
+    code_insee: str,
+    mode: NeighborMode,
+    db_path: Path = DB_PATH,
+) -> dict[str, int]:
+    """Retourne le périmètre INSEE pour la recherche, indexé par rang.
+
+    `{code_insee_principal: 0, voisin_rang1: 1, voisin_rang2: 2, ...}`.
+    Pour mode `NONE`, seule la commune principale est incluse.
+    """
+    scope: dict[str, int] = {code_insee: 0}
+    if mode is NeighborMode.NONE:
+        return scope
+
+    max_rang = 1 if mode is NeighborMode.RANK1 else 2
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        rows = con.execute(
+            "SELECT code_insee_b, MIN(rang) FROM communes_adjacency "
+            "WHERE code_insee_a = ? AND rang <= ? GROUP BY code_insee_b",
+            [code_insee, max_rang],
+        ).fetchall()
+    finally:
+        con.close()
+
+    for code_b, rang in rows:
+        if code_b not in scope:
+            scope[code_b] = rang
+    return scope
 
 
 if __name__ == "__main__":

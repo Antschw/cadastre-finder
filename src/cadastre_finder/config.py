@@ -45,7 +45,7 @@ DEPARTMENTS = [
 
 # URLs sources
 CADASTRE_BASE_URL = "https://cadastre.data.gouv.fr/data/etalab-cadastre"
-API_ADRESSE_URL = "https://api-adresse.data.gouv.fr"
+GEOPF_API_URL = "https://data.geopf.fr/geocodage"
 
 # Projections
 CRS_LAMBERT93 = "EPSG:2154"
@@ -54,8 +54,18 @@ CRS_WGS84 = "EPSG:4326"
 # Seuils métier
 MIN_TERRAIN_M2 = 2500
 MIN_ANCHOR_BUILT_M2 = 65
+MAX_BUILT_RATIO = 0.50          # exclusion : terrain dont le bâti dépasse 50%
+MIN_COMPACTNESS = 0.10          # exclusion : compacité Polsby-Popper < 0.1
 DEFAULT_TOLERANCE_PCT = 5.0
 DEFAULT_TOP_N = 20
+
+# Poids du scoring continu (search_orchestrated)
+SCORE_W_DISTANCE = 20.0
+SCORE_W_SURFACE = 40.0
+SCORE_W_OCCUPATION = 15.0
+SCORE_W_COMPACT = 10.0
+SCORE_BONUS_DPE_PARCEL = 500.0
+SCORE_BONUS_DPE_LABEL = 100.0
 
 # DPE settings
 DPE_TABLE = "dpe"
