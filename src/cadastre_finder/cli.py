@@ -98,6 +98,7 @@ def cmd_build_adjacency(args: argparse.Namespace) -> int:
     build_adjacency_table(
         db_path=Path(args.db),
         include_rank2=not args.no_rank2,
+        include_rank3=not args.no_rank3,
         force=args.force,
     )
     return 0
@@ -319,6 +320,7 @@ def main() -> None:
     # build-adjacency
     p_adj = sub.add_parser("build-adjacency", help="Calcul table d'adjacence communes")
     p_adj.add_argument("--no-rank2", action="store_true", help="Ne pas calculer le rang 2")
+    p_adj.add_argument("--no-rank3", action="store_true", help="Ne pas calculer le rang 3")
     p_adj.add_argument("--force", action="store_true", help="Supprimer et reconstruire même si déjà présent")
     p_adj.set_defaults(func=cmd_build_adjacency)
 

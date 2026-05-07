@@ -27,12 +27,14 @@ _BATCH_INSERT = 10_000  # paires par executemany
 def build_adjacency_table(
     db_path: Path = DB_PATH,
     include_rank2: bool = True,
+    include_rank3: bool = True,
     force: bool = False,
 ) -> None:
     """Construit la table `communes_adjacency` (code_insee_a, code_insee_b, rang).
 
     - rang=1 : communes qui se touchent (voisines directes)
     - rang=2 : voisines des voisines (calculé si include_rank2=True)
+    - rang=3 : voisines des voisines des voisines (calculé si include_rank2 et include_rank3=True)
 
     La relation est symétrique : si (A, B) existe alors (B, A) existe.
     """
@@ -145,6 +147,36 @@ def build_adjacency_table(
             n2_db = con.execute("SELECT COUNT(*) FROM communes_adjacency WHERE rang = 2").fetchone()[0]
             logger.info(f"Rang 2 : {n2_db} paires insérées (symétrisées).")
 
+            # --- Rang 3 ---
+            if include_rank3:
+                logger.info("Calcul rang 3 (voisins des voisins des voisins)...")
+
+                rang2_set: set[tuple[str, str]] = set()
+                for a, b in pairs_rang2:
+                    rang2_set.add((a, b))
+                    rang2_set.add((b, a))
+
+                pairs_rang3: set[tuple[str, str]] = set()
+                for code_a in tqdm(adj, desc="Rang 3 — voisins×3", unit="commune"):
+                    for m1 in adj[code_a]:
+                        for m2 in adj[m1]:
+                            for code_c in adj[m2]:
+                                if code_c == code_a:
+                                    continue
+                                if (code_a, code_c) in rang1_set:
+                                    continue
+                                if (code_a, code_c) in rang2_set:
+                                    continue
+                                pairs_rang3.add((min(code_a, code_c), max(code_a, code_c)))
+
+                n3 = len(pairs_rang3)
+                logger.info(f"Rang 3 : {n3} paires trouvées. Insertion en base (+ symétrique)...")
+                _batch_insert(con, list(pairs_rang3), rang=3)
+                _batch_insert(con, [(b, a) for a, b in pairs_rang3], rang=3)
+
+                n3_db = con.execute("SELECT COUNT(*) FROM communes_adjacency WHERE rang = 3").fetchone()[0]
+                logger.info(f"Rang 3 : {n3_db} paires insérées (symétrisées).")
+
         # --- Index ---
         logger.info("Création des index...")
         con.execute("""
@@ -220,7 +252,7 @@ def resolve_insee_scope(
     if mode is NeighborMode.NONE:
         return scope
 
-    max_rang = 1 if mode is NeighborMode.RANK1 else 2
+    max_rang = {NeighborMode.RANK1: 1, NeighborMode.RANK2: 2, NeighborMode.RANK3: 3}.get(mode, 2)
     con = duckdb.connect(str(db_path), read_only=True)
     try:
         rows = con.execute(
@@ -243,6 +275,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Calcul table d'adjacence communes")
     parser.add_argument("--db", default=str(DB_PATH), help="Chemin DuckDB")
     parser.add_argument("--no-rank2", action="store_true", help="Ne pas calculer le rang 2")
+    parser.add_argument("--no-rank3", action="store_true", help="Ne pas calculer le rang 3")
     args = parser.parse_args()
 
-    build_adjacency_table(db_path=Path(args.db), include_rank2=not args.no_rank2)
+    build_adjacency_table(
+        db_path=Path(args.db),
+        include_rank2=not args.no_rank2,
+        include_rank3=not args.no_rank3,
+    )

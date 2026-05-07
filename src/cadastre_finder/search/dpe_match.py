@@ -17,9 +17,13 @@ from loguru import logger
 from shapely.geometry import shape
 from shapely.ops import unary_union
 
+from pyproj import Transformer
+
 from cadastre_finder.config import DB_PATH, DPE_TABLE
-from cadastre_finder.search.models import ComboMatch, ParcelMatch
+from cadastre_finder.search.models import ComboMatch, DPEPositionMatch, ParcelMatch
 from cadastre_finder.utils.geocoding import geocode_address, reverse_geocode_parcel
+
+_lambert93_to_wgs84 = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
 
 
 _MAX_AGGREGATE_PARTS = 6
@@ -658,6 +662,120 @@ def dpe_led_search(
 
     logger.info(f"[dpe_match] {len(matches)} parcelle(s)/combo(s) localisé(s) via DPE.")
     return matches
+
+
+# ---------------------------------------------------------------------------
+# Recherche directe de positions DPE (sans matching parcellaire)
+# ---------------------------------------------------------------------------
+
+def search_dpe_positions(
+    scope_rang: dict[str, int],
+    living_surface: float,
+    dpe_label: Optional[str] = None,
+    ges_label: Optional[str] = None,
+    tolerance_pct: float = 5.0,
+    limit: int = 20,
+    db_path: Path = DB_PATH,
+) -> list[DPEPositionMatch]:
+    """Retourne directement les positions GPS des enregistrements DPE correspondants.
+
+    Filtre par surface habitable ± tolérance et labels DPE/GES. Convertit les
+    coordonnées Lambert93 (EPSG:2154) en WGS84. Ignore les enregistrements sans
+    coordonnées valides.
+    """
+    if not scope_rang or living_surface <= 0:
+        return []
+
+    insee_codes = list(scope_rang.keys())
+    delta = living_surface * tolerance_pct / 100.0
+    lo, hi = living_surface - delta, living_surface + delta
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        table_exists = con.execute(
+            f"SELECT count(*) FROM information_schema.tables WHERE table_name = '{DPE_TABLE}'"
+        ).fetchone()[0]
+        if not table_exists:
+            logger.warning(f"Table {DPE_TABLE} absente. Lancez l'ingestion DPE.")
+            return []
+
+        cols = {r[0].lower() for r in con.execute(f"DESCRIBE {DPE_TABLE}").fetchall()}
+        has_coords = (
+            "coordonnee_cartographique_x_ban" in cols
+            and "coordonnee_cartographique_y_ban" in cols
+        )
+        if not has_coords:
+            logger.warning("[dpe_positions] Colonnes de coordonnées BAN absentes de la table DPE.")
+            return []
+
+        placeholders = ", ".join("?" * len(insee_codes))
+        query = f"""
+            SELECT
+                adresse_brut, code_postal_brut, nom_commune_brut, code_insee_ban,
+                surface_habitable_logement, etiquette_dpe, etiquette_ges,
+                date_etablissement_dpe,
+                coordonnee_cartographique_x_ban, coordonnee_cartographique_y_ban
+            FROM {DPE_TABLE}
+            WHERE code_insee_ban IN ({placeholders})
+              AND surface_habitable_logement BETWEEN ? AND ?
+              AND coordonnee_cartographique_x_ban IS NOT NULL
+              AND coordonnee_cartographique_y_ban IS NOT NULL
+        """
+        params: list = [*insee_codes, lo, hi]
+
+        if dpe_label:
+            query += " AND etiquette_dpe = ?"
+            params.append(dpe_label)
+        if ges_label:
+            query += " AND etiquette_ges = ?"
+            params.append(ges_label)
+
+        query += " ORDER BY date_etablissement_dpe DESC LIMIT ?"
+        params.append(limit * 3)  # Marge car on filtre les coords invalides
+
+        rows = con.execute(query, params).fetchall()
+    except Exception as e:
+        logger.error(f"[dpe_positions] Erreur requête DPE : {e}")
+        return []
+    finally:
+        con.close()
+
+    results: list[DPEPositionMatch] = []
+    for r in rows:
+        x_ban, y_ban = r[8], r[9]
+        try:
+            lon, lat = _lambert93_to_wgs84.transform(float(x_ban), float(y_ban))
+        except Exception:
+            continue
+        # Coordonnées hors France métropolitaine → ignorer
+        if not (41.0 <= lat <= 51.5 and -5.5 <= lon <= 10.0):
+            continue
+
+        surface = r[4] or 0.0
+        rank = scope_rang.get(r[3], 0)
+        score = max(0.0, 100.0 - abs(surface - living_surface) / living_surface * 100.0) - rank * 3
+
+        results.append(DPEPositionMatch(
+            address=r[0] or "",
+            postcode=r[1] or "",
+            city=r[2] or "",
+            code_insee=r[3] or "",
+            surface_habitable=surface,
+            dpe_label=r[5],
+            ges_label=r[6],
+            date=str(r[7]) if r[7] else None,
+            centroid_lat=lat,
+            centroid_lon=lon,
+            score=round(score, 1),
+            rank=rank,
+        ))
+
+        if len(results) >= limit:
+            break
+
+    results.sort(key=lambda m: m.score, reverse=True)
+    logger.info(f"[dpe_positions] {len(results)} position(s) DPE trouvée(s).")
+    return results
 
 
 # ---------------------------------------------------------------------------
