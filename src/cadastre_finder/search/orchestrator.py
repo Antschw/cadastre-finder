@@ -66,7 +66,7 @@ def search_orchestrated(
     )
 
     if dpe_label or ges_label:
-        results: list[Union[ParcelMatch, ComboMatch]] = list(dpe_led_search(
+        dpe_results: list[Union[ParcelMatch, ComboMatch]] = list(dpe_led_search(
             insee_codes=list(scope_rang.keys()),
             target_terrain=surface_m2,
             living_surface=living_surface,
@@ -76,14 +76,37 @@ def search_orchestrated(
             limit=DEFAULT_TOP_N,
             db_path=db_path,
         ))
-        # Propage le rang depuis le scope (pour le rendu UI)
-        for m in results:
+        for m in dpe_results:
             if isinstance(m, ParcelMatch):
                 m.rank = scope_rang.get(m.code_insee, 0)
             else:
                 m.rank = min(scope_rang.get(p.code_insee, 0) for p in m.parts)
+
+        results = apply_hard_filters(
+            dpe_results,
+            target_terrain=surface_m2,
+            tolerance_pct=tolerance_pct,
+            db_path=db_path,
+        )
+
+        if not results:
+            logger.info("[orchestrator] Fallback : aucun match DPE satisfaisant, passage au combo-led.")
+            combo_results = _combo_led_search(
+                commune=commune,
+                surface_m2=surface_m2,
+                postal_code=postal_code,
+                tolerance_pct=tolerance_pct,
+                neighbor_mode=neighbor_mode,
+                db_path=db_path,
+            )
+            results = apply_hard_filters(
+                combo_results,
+                target_terrain=surface_m2,
+                tolerance_pct=tolerance_pct,
+                db_path=db_path,
+            )
     else:
-        results = _combo_led_search(
+        raw = _combo_led_search(
             commune=commune,
             surface_m2=surface_m2,
             postal_code=postal_code,
@@ -91,13 +114,31 @@ def search_orchestrated(
             neighbor_mode=neighbor_mode,
             db_path=db_path,
         )
+        results = apply_hard_filters(
+            raw,
+            target_terrain=surface_m2,
+            tolerance_pct=tolerance_pct,
+            db_path=db_path,
+        )
 
-    results = apply_hard_filters(
-        results,
-        target_terrain=surface_m2,
-        tolerance_pct=tolerance_pct,
-        db_path=db_path,
-    )
+    # Fallback externe : département hors périmètre local et aucun résultat local
+    if not results:
+        from cadastre_finder.config import DEPARTMENTS
+        dept = code_insee_main[:2]
+        if dept not in DEPARTMENTS:
+            logger.info(
+                f"[orchestrator] Département {dept} hors périmètre → recherche externe API."
+            )
+            from cadastre_finder.search.external_search import search_external
+            results = search_external(
+                commune=commune,
+                surface_m2=surface_m2,
+                living_surface=living_surface,
+                dpe_label=dpe_label,
+                ges_label=ges_label,
+                postal_code=postal_code,
+                tolerance_pct=max(tolerance_pct, 10.0),
+            )
 
     commune_centroid = _commune_centroid(code_insee_main, db_path)
     return _score_and_limit(

@@ -46,6 +46,9 @@ DEPARTMENTS = [
 # URLs sources
 CADASTRE_BASE_URL = "https://cadastre.data.gouv.fr/data/etalab-cadastre"
 GEOPF_API_URL = "https://data.geopf.fr/geocodage"
+# Dataset national "DPE Logements existants depuis juillet 2021" (meg-83tjwtg8dyz4vv7h1dqe)
+ADEME_API_URL = "https://data.ademe.fr/data-fair/api/v1/datasets/meg-83tjwtg8dyz4vv7h1dqe"
+IGN_APICARTO_URL = "https://apicarto.ign.fr/api/cadastre"
 
 # Projections
 CRS_LAMBERT93 = "EPSG:2154"

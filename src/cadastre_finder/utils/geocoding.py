@@ -146,9 +146,12 @@ def _search_api(
         if isinstance(code_insee, list) and code_insee:
             code_insee = code_insee[0]
 
-        nom = props.get("city", "")
+        nom = props.get("city", "") or props.get("name", "") or props.get("label", "")
         if isinstance(nom, list) and nom:
             nom = nom[0]
+        # Géoplateforme renvoie parfois "Commune (CP)" dans label — ne garder que le nom
+        if nom and "(" in nom:
+            nom = nom.split("(")[0].strip()
 
         score = props.get("score", 0.0)
         code_dept = code_insee[:2] if len(code_insee) >= 2 else ""
@@ -200,23 +203,27 @@ def geocode_address(
     return None
 
 
-def reverse_geocode_parcel(lat: float, lon: float) -> Optional[str]:
-    """Trouve l'ID de la parcelle cadastrale aux coordonnées données via l'API Géoplateforme."""
+def reverse_geocode_parcel(lat: float, lon: float) -> list[str]:
+    """Retourne jusqu'à 5 IDs de parcelles cadastrales proches des coordonnées données."""
     params = {
         "lat": lat,
         "lon": lon,
         "index": "parcel",
-        "limit": 1,
+        "limit": 5,
+        "returntruegeometry": "true",
     }
     try:
         resp = httpx.get(f"{GEOPF_API_URL}/reverse", params=params, timeout=5)
         resp.raise_for_status()
         data = resp.json()
-        if data.get("features"):
-            return data["features"][0]["properties"].get("id")
+        return [
+            f["properties"]["id"]
+            for f in data.get("features", [])
+            if f.get("properties", {}).get("id")
+        ]
     except Exception as e:
         logger.debug(f"[geocoding] Erreur reverse geocoding parcelle ({lat}, {lon}) : {e}")
-    return None
+    return []
 
 
 def resolve_commune(

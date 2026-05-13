@@ -109,9 +109,22 @@ def _load_adjacency_spatial(
     con: duckdb.DuckDBPyConnection,
     codes_insee: list[str],
     max_contenance: float,
+    candidate_ids: Optional[list[str]] = None,
 ) -> dict[str, set[str]]:
-    """Calcule l'adjacence à la volée par jointure spatiale (plus lent)."""
+    """Calcule l'adjacence à la volée par jointure spatiale (plus lent).
+
+    Si `candidate_ids` est fourni, limite la jointure aux parcelles candidates
+    pour éviter une explosion quadratique sur toute la commune.
+    """
     placeholders = ", ".join("?" * len(codes_insee))
+    params: list = [*codes_insee, MIN_PART_M2, max_contenance, MIN_PART_M2, max_contenance]
+
+    id_filter = ""
+    if candidate_ids:
+        id_ph = ", ".join("?" * len(candidate_ids))
+        id_filter = f"AND (a.id IN ({id_ph}) OR b.id IN ({id_ph}))"
+        params.extend(candidate_ids * 2)
+
     rows = con.execute(f"""
         SELECT DISTINCT a.id, b.id
         FROM parcelles a
@@ -124,7 +137,8 @@ def _load_adjacency_spatial(
         WHERE a.code_insee IN ({placeholders})
           AND a.contenance >= ? AND a.contenance <= ?
           AND b.contenance >= ? AND b.contenance <= ?
-    """, [*codes_insee, MIN_PART_M2, max_contenance, MIN_PART_M2, max_contenance]).fetchall()
+          {id_filter}
+    """, params).fetchall()
 
     graph: dict[str, set[str]] = {}
     for id_a, id_b in rows:
@@ -143,11 +157,11 @@ def _get_adjacency(
     graph = _load_adjacency_precomputed(con, candidate_ids)
     if graph is None:
         logger.info("[combo_match] Table pré-calculée absente → jointure spatiale (plus lent).")
-        return _load_adjacency_spatial(con, codes_insee, max_contenance)
+        return _load_adjacency_spatial(con, codes_insee, max_contenance, candidate_ids)
     if not graph:
         # Table présente mais aucune paire pour ces candidats → données non encore calculées
         logger.info("[combo_match] Table pré-calculée vide pour ces communes → jointure spatiale.")
-        return _load_adjacency_spatial(con, codes_insee, max_contenance)
+        return _load_adjacency_spatial(con, codes_insee, max_contenance, candidate_ids)
     logger.debug("[combo_match] Adjacence chargée depuis la table pré-calculée.")
     return graph
 

@@ -198,8 +198,8 @@ def _fetch_best_anchor(
 
     # Fallback API
     logger.debug(f"[dpe_match] Pas d'ancre locale idéale pour ({lat}, {lon}), appel API...")
-    parcel_id = reverse_geocode_parcel(lat, lon)
-    if parcel_id:
+    parcel_ids = reverse_geocode_parcel(lat, lon)
+    for parcel_id in parcel_ids:
         anchor = _fetch_parcel_by_id(con, parcel_id, dpe_record)
         if anchor:
             return anchor
@@ -309,6 +309,107 @@ def _fetch_parcel_at_point(
         dpe_label=dpe_record.get("dpe"),
         ges_label=dpe_record.get("ges"),
     )
+
+
+def _fetch_local_pool(
+    con: duckdb.DuckDBPyConnection,
+    lat: float,
+    lon: float,
+    insee: Optional[str],
+    radius_m: float = 100.0,
+) -> list[tuple]:
+    """Récupère toutes les parcelles dans un rayon donné autour d'un point (en mètres).
+
+    Utilise ST_Buffer en degrés (~0.001° ≈ 100m en France) pour le filtre spatial,
+    puis calcule la distance réelle en Lambert93 pour le tri et le seuillage.
+    """
+    approx_deg = radius_m / 111_000.0
+    rows = con.execute("""
+        SELECT id, code_insee, contenance,
+               ST_X(ST_Centroid(geometry)) AS clon,
+               ST_Y(ST_Centroid(geometry)) AS clat,
+               ST_AsGeoJSON(geometry) AS geojson,
+               ST_Distance(
+                   ST_Transform(ST_FlipCoordinates(ST_Point(?, ?)), 'EPSG:4326', 'EPSG:2154'),
+                   ST_Transform(ST_FlipCoordinates(geometry), 'EPSG:4326', 'EPSG:2154')
+               ) AS dist_m
+        FROM parcelles
+        WHERE ST_Intersects(geometry, ST_Buffer(ST_Point(?, ?), ?))
+          AND (code_insee = ? OR ? IS NULL)
+        ORDER BY dist_m
+    """, [lon, lat, lon, lat, approx_deg, insee, insee]).fetchall()
+    return [r for r in rows if r[6] <= radius_m]
+
+
+def _is_connected(geoms: list) -> bool:
+    """Vérifie si une liste de géométries Shapely forme un seul bloc contigu (BFS)."""
+    if not geoms:
+        return False
+    if len(geoms) == 1:
+        return True
+
+    n = len(geoms)
+    adj: dict[int, set[int]] = {i: set() for i in range(n)}
+    for i in range(n):
+        for j in range(i + 1, n):
+            if geoms[i].intersects(geoms[j]):
+                adj[i].add(j)
+                adj[j].add(i)
+
+    visited = {0}
+    queue = list(adj[0])
+    while queue:
+        curr = queue.pop(0)
+        if curr not in visited:
+            visited.add(curr)
+            queue.extend(adj[curr] - visited)
+    return len(visited) == n
+
+
+def _find_micro_combos_in_pool(
+    con: duckdb.DuckDBPyConnection,
+    pool: list[tuple],
+    target_terrain: float,
+    tolerance_pct: float,
+    dpe_record: dict,
+    max_parts: int = 4,
+) -> list[ComboMatch]:
+    """Cherche des combinaisons contiguës de parcelles dans le pool local.
+
+    Pré-parse les géométries une seule fois, filtre par surface puis par
+    contiguïté spatiale (Shapely) avant de construire le ComboMatch.
+    S'arrête au plus petit k donnant des résultats.
+    """
+    from itertools import combinations as _combinations
+
+    delta = target_terrain * tolerance_pct / 100.0
+    lo, hi = target_terrain - delta, target_terrain + delta
+    found: list[ComboMatch] = []
+
+    # Pré-parser les géométries Shapely une seule fois (r[5] = GeoJSON)
+    parsed_geoms: list[Optional[object]] = []
+    for r in pool:
+        try:
+            parsed_geoms.append(shape(json.loads(r[5])))
+        except Exception:
+            parsed_geoms.append(None)
+
+    for k in range(2, min(max_parts + 1, len(pool) + 1)):
+        for idx_combo in _combinations(range(len(pool)), k):
+            total = sum(pool[i][2] for i in idx_combo)
+            if not (lo <= total <= hi):
+                continue
+            geoms = [parsed_geoms[i] for i in idx_combo if parsed_geoms[i] is not None]
+            if len(geoms) != k or not _is_connected(geoms):
+                continue
+            ids = [pool[i][0] for i in idx_combo]
+            full = _fetch_parcels_bulk(con, ids)
+            parts = [full[pid] for pid in ids if pid in full]
+            if parts:
+                found.append(_build_combo_from_parts(parts, dpe_record))
+        if found:
+            break
+    return found
 
 
 def _fetch_neighbor_ids(con: duckdb.DuckDBPyConnection, parcel_id: str) -> list[str]:
@@ -574,6 +675,26 @@ def find_parcel_for_dpe_record(
     try:
         con.execute("LOAD spatial;")
 
+        # --- Phase 1 : Filet de pêche local ---
+        pool = _fetch_local_pool(con, lat, lon, dpe_record.get("code_insee"))
+
+        if pool and target_terrain is not None:
+            delta = target_terrain * tolerance_pct / 100.0
+            lo, hi = target_terrain - delta, target_terrain + delta
+
+            # Cherche d'abord une parcelle unique dans le pool
+            for r in pool:
+                if lo <= r[2] <= hi:
+                    logger.debug(f"[dpe_match] Match direct dans le pool : {r[2]}m2")
+                    return [_row_to_parcel_match(con, r, dpe_record)]
+
+            # Micro-combos dans le pool
+            combos = _find_micro_combos_in_pool(con, pool, target_terrain, tolerance_pct, dpe_record)
+            if combos:
+                logger.debug(f"[dpe_match] {len(combos)} micro-combo(s) trouvé(s) dans le pool.")
+                return combos
+
+        # --- Phase 2 : Fallback ancre + BFS ---
         anchor = _fetch_best_anchor(con, lat, lon, dpe_record)
         if anchor is None:
             return []
@@ -584,28 +705,23 @@ def find_parcel_for_dpe_record(
         delta = target_terrain * tolerance_pct / 100.0
         lo, hi = target_terrain - delta, target_terrain + delta
 
-        # Parcelle ancre déjà dans la fenêtre cible
         if lo <= anchor.contenance <= hi:
             return [anchor]
 
-        # Parcelle ancre plus petite → tenter agrégation
         if anchor.contenance < lo:
-            # On tente plusieurs niveaux de relâchement pour l'agrégation
             for attempt in range(3):
                 current_tol = tolerance_pct
                 if attempt == 1:
-                    current_tol = max(tolerance_pct, 5.0)  # min 5%
+                    current_tol = max(tolerance_pct, 5.0)
                 elif attempt == 2:
-                    current_tol = max(tolerance_pct, 15.0) # min 15%
-
+                    current_tol = max(tolerance_pct, 15.0)
                 combos = _aggregate_around(con, anchor, target_terrain, current_tol, dpe_record)
                 if combos:
                     logger.debug(
-                        f"[dpe_match] {len(combos)} combo(s) trouvé(s) pour {target_terrain}m2 "
+                        f"[dpe_match] {len(combos)} combo(s) BFS trouvé(s) pour {target_terrain}m2 "
                         f"(essai: {attempt+1})"
                     )
                     return combos
-
                 if attempt == 2:
                     break
 

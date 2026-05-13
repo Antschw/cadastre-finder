@@ -180,6 +180,42 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_search_external(args: argparse.Namespace) -> int:
+    """Recherche via API publiques (IGN Apicarto + ADEME) pour tout département français."""
+    from cadastre_finder.search.external_search import search_external
+    from cadastre_finder.out.map import render_results
+
+    commune = args.commune
+    surface = args.surface
+
+    results = search_external(
+        commune=commune,
+        surface_m2=surface,
+        living_surface=getattr(args, "living_surface", None),
+        dpe_label=getattr(args, "dpe", None),
+        ges_label=getattr(args, "ges", None),
+        postal_code=getattr(args, "postal", None),
+        tolerance_pct=args.tolerance,
+    )
+
+    if not results:
+        logger.warning("Aucun résultat via API publiques.")
+        return 0
+
+    output_path = OUTPUT_DIR / f"result_ext_{commune.replace(' ', '_')}.html"
+    from cadastre_finder.search.models import ParcelMatch, ComboMatch
+    matches = [r for r in results if isinstance(r, ParcelMatch)]
+    combos = [r for r in results if isinstance(r, ComboMatch)]
+    render_results(
+        matches,
+        output_path=output_path,
+        combos=combos,
+        query_info={"commune": commune, "surface_m2": surface, "titre": "Résultats externes (API publiques)"},
+        auto_open=not args.no_open,
+    )
+    return 0
+
+
 def cmd_ui(args: argparse.Namespace) -> int:
     import subprocess
     import sys
@@ -356,6 +392,25 @@ def main() -> None:
     p_search.add_argument("--include-agricultural", action="store_true", help="Inclure les parcelles sans bâtiment (agricoles)")
     p_search.add_argument("--no-open", action="store_true", help="Ne pas ouvrir le navigateur")
     p_search.set_defaults(func=cmd_search)
+
+    # search-external
+    p_ext = sub.add_parser(
+        "search-external",
+        help="Recherche via API publiques (IGN + ADEME) — tout département français",
+    )
+    p_ext.add_argument("--commune", required=True, help="Nom de la commune")
+    p_ext.add_argument("--surface", type=float, required=True, help="Surface terrain en m²")
+    p_ext.add_argument("--living-surface", type=float, dest="living_surface",
+                       help="Surface habitable en m²")
+    p_ext.add_argument("--dpe", choices=["A", "B", "C", "D", "E", "F", "G"],
+                       help="Étiquette DPE")
+    p_ext.add_argument("--ges", choices=["A", "B", "C", "D", "E", "F", "G"],
+                       help="Étiquette GES")
+    p_ext.add_argument("--postal", help="Code postal (pour désambiguïser la commune)")
+    p_ext.add_argument("--tolerance", type=float, default=10.0,
+                       help="Tolérance surface en pourcent (défaut : 10)")
+    p_ext.add_argument("--no-open", action="store_true", help="Ne pas ouvrir le navigateur")
+    p_ext.set_defaults(func=cmd_search_external)
 
     # ui
     p_ui = sub.add_parser("ui", help="Lancer l'interface graphique Streamlit")
