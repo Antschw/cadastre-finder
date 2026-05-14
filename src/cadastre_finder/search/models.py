@@ -42,7 +42,9 @@ class ParcelMatch:
         return (
             f"https://www.geoportail.gouv.fr/carte?"
             f"c={self.centroid_lon},{self.centroid_lat}&z=17"
-            f"&l0=GEOGRAPHICALGRIDSYSTEMS.MAPS"
+            f"&l0=ORTHOIMAGERY.ORTHOPHOTOS::GEOPORTAIL:OGC:WMTS(1)"
+            f"&l1=CADASTRALPARCELS.PARCELLAIRE_EXPRESS::GEOPORTAIL:OGC:WMTS(0.7)"
+            f"&permalink=yes"
         )
 
     @property
@@ -92,7 +94,9 @@ class ComboMatch:
         return (
             f"https://www.geoportail.gouv.fr/carte?"
             f"c={self.centroid_lon},{self.centroid_lat}&z=17"
-            f"&l0=GEOGRAPHICALGRIDSYSTEMS.MAPS"
+            f"&l0=ORTHOIMAGERY.ORTHOPHOTOS::GEOPORTAIL:OGC:WMTS(1)"
+            f"&l1=CADASTRALPARCELS.PARCELLAIRE_EXPRESS::GEOPORTAIL:OGC:WMTS(0.7)"
+            f"&permalink=yes"
         )
 
     @property
@@ -124,7 +128,9 @@ class DPEPositionMatch:
         return (
             f"https://www.geoportail.gouv.fr/carte?"
             f"c={self.centroid_lon},{self.centroid_lat}&z=17"
-            f"&l0=GEOGRAPHICALGRIDSYSTEMS.MAPS"
+            f"&l0=ORTHOIMAGERY.ORTHOPHOTOS::GEOPORTAIL:OGC:WMTS(1)"
+            f"&l1=CADASTRALPARCELS.PARCELLAIRE_EXPRESS::GEOPORTAIL:OGC:WMTS(0.7)"
+            f"&permalink=yes"
         )
 
     @property

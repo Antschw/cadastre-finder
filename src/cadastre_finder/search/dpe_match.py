@@ -784,25 +784,150 @@ def dpe_led_search(
 # Recherche directe de positions DPE (sans matching parcellaire)
 # ---------------------------------------------------------------------------
 
+def _query_api_positions(
+    scope_rang: dict[str, int],
+    living_surface: float,
+    dpe_label: Optional[str],
+    ges_label: Optional[str],
+    dpe_date: Optional[str],
+    tolerance_pct: float,
+    limit: int,
+) -> list[DPEPositionMatch]:
+    """Interroge l'API ADEME Open Data et convertit les résultats en DPEPositionMatch.
+
+    Itère sur chaque commune du scope. Applique le filtre dpe_date côté Python
+    (l'API Elasticsearch ne supporte pas ce filtre directement).
+    Retourne une liste vide si l'API est indisponible ou retourne 0 résultat.
+    """
+    from cadastre_finder.search.external_search import _query_ademe_api
+
+    # Tentatives progressives : plein → sans GES → sans DPE ni GES
+    label_attempts = [(dpe_label, ges_label)]
+    if dpe_label or ges_label:
+        label_attempts.append((dpe_label, None))
+        label_attempts.append((None, None))
+
+    all_records: list[DPEPositionMatch] = []
+    seen_addresses: set[str] = set()
+
+    for attempt_idx, (try_dpe, try_ges) in enumerate(label_attempts):
+        if attempt_idx > 0 and all_records:
+            break
+        if attempt_idx > 0:
+            logger.debug(
+                f"[dpe_positions/api] Relâchement essai {attempt_idx + 1} : "
+                f"dpe={try_dpe}, ges={try_ges}"
+            )
+
+        for insee_code, rank in scope_rang.items():
+            raw = _query_ademe_api(
+                insee_code=insee_code,
+                living_surface=living_surface,
+                dpe_label=try_dpe,
+                ges_label=try_ges,
+                tolerance_pct=tolerance_pct,
+                limit=limit * 3,
+            )
+            for rec in raw:
+                # Filtre date côté Python (l'API ne le supporte pas)
+                if dpe_date and rec.get("date") and str(rec["date"])[:10] != dpe_date:
+                    continue
+
+                lat, lon = None, None
+
+                # Priorité : _geopoint WGS84 natif (lat,lon)
+                if rec.get("geopoint"):
+                    try:
+                        parts = str(rec["geopoint"]).split(",")
+                        if len(parts) == 2:
+                            lat_t, lon_t = float(parts[0]), float(parts[1])
+                            if 41.0 <= lat_t <= 51.5 and -5.5 <= lon_t <= 10.0:
+                                lat, lon = lat_t, lon_t
+                    except Exception:
+                        pass
+
+                # Fallback : coordonnées Lambert93 BAN
+                if lat is None and rec.get("coord_x") and rec.get("coord_y"):
+                    try:
+                        lon_t, lat_t = _lambert93_to_wgs84.transform(
+                            float(rec["coord_x"]), float(rec["coord_y"])
+                        )
+                        if 41.0 <= lat_t <= 51.5 and -5.5 <= lon_t <= 10.0:
+                            lat, lon = lat_t, lon_t
+                    except Exception:
+                        pass
+
+                if lat is None:
+                    continue
+
+                address = rec.get("address") or ""
+                key = f"{address}|{rec.get('code_insee', '')}"
+                if key in seen_addresses:
+                    continue
+                seen_addresses.add(key)
+
+                surface = float(rec["surface"]) if rec.get("surface") is not None else 0.0
+                score = max(0.0, 100.0 - abs(surface - living_surface) / living_surface * 100.0) - rank * 3
+
+                all_records.append(DPEPositionMatch(
+                    address=address,
+                    postcode=rec.get("postcode") or "",
+                    city=rec.get("city") or "",
+                    code_insee=rec.get("code_insee") or "",
+                    surface_habitable=surface,
+                    dpe_label=rec.get("dpe"),
+                    ges_label=rec.get("ges"),
+                    date=str(rec["date"])[:10] if rec.get("date") else None,
+                    centroid_lat=lat,
+                    centroid_lon=lon,
+                    score=round(score, 1),
+                    rank=rank,
+                ))
+
+        if all_records:
+            break
+
+    all_records.sort(key=lambda m: m.score, reverse=True)
+    logger.info(f"[dpe_positions/api] {len(all_records)} position(s) DPE trouvée(s) via API ADEME.")
+    return all_records[:limit]
+
+
 def search_dpe_positions(
     scope_rang: dict[str, int],
     living_surface: float,
     dpe_label: Optional[str] = None,
     ges_label: Optional[str] = None,
     dpe_date: Optional[str] = None,
+    conso_ep: Optional[float] = None,
+    ges_ep: Optional[float] = None,
     tolerance_pct: float = 5.0,
     limit: int = 20,
     db_path: Path = DB_PATH,
 ) -> list[DPEPositionMatch]:
     """Retourne directement les positions GPS des enregistrements DPE correspondants.
 
-    Filtre par surface habitable ± tolérance et labels DPE/GES. Convertit les
-    coordonnées Lambert93 (EPSG:2154) en WGS84. Ignore les enregistrements sans
-    coordonnées valides.
+    Interroge d'abord l'API ADEME Open Data (toujours à jour) puis bascule sur la
+    base locale si l'API retourne 0 résultat. Les filtres kWh/CO₂ (conso_ep, ges_ep)
+    s'appliquent uniquement via la base locale (l'API ne les expose pas).
     """
     if not scope_rang or living_surface <= 0:
         return []
 
+    # --- Phase 1 : API ADEME (prioritaire) ---
+    api_hits = _query_api_positions(
+        scope_rang=scope_rang,
+        living_surface=living_surface,
+        dpe_label=dpe_label,
+        ges_label=ges_label,
+        dpe_date=dpe_date,
+        tolerance_pct=tolerance_pct,
+        limit=limit,
+    )
+    if api_hits:
+        return api_hits
+
+    # --- Phase 2 : fallback base locale ---
+    logger.info("[dpe_positions] API ADEME sans résultat — basculement base locale.")
     insee_codes = list(scope_rang.keys())
     delta = living_surface * tolerance_pct / 100.0
     lo, hi = living_surface - delta, living_surface + delta
@@ -825,8 +950,11 @@ def search_dpe_positions(
             logger.warning("[dpe_positions] Colonnes de coordonnées BAN absentes de la table DPE.")
             return []
 
+        has_conso = "conso_5_usages_par_m2_ep" in cols
+        has_ges_ep = "emission_ges_5_usages par_m2" in cols
+
         placeholders = ", ".join("?" * len(insee_codes))
-        query = f"""
+        base_query = f"""
             SELECT
                 adresse_brut, code_postal_brut, nom_commune_brut, code_insee_ban,
                 surface_habitable_logement, etiquette_dpe, etiquette_ges,
@@ -838,22 +966,45 @@ def search_dpe_positions(
               AND coordonnee_cartographique_x_ban IS NOT NULL
               AND coordonnee_cartographique_y_ban IS NOT NULL
         """
-        params: list = [*insee_codes, lo, hi]
 
-        if dpe_label:
-            query += " AND etiquette_dpe = ?"
-            params.append(dpe_label)
-        if ges_label:
-            query += " AND etiquette_ges = ?"
-            params.append(ges_label)
-        if dpe_date:
-            query += " AND date_etablissement_dpe = ?"
-            params.append(dpe_date)
+        # Relâchement progressif : essai 0=tout, essai 1=sans conso/ges_ep, essai 2=sans GES
+        rows: list = []
+        for attempt in range(3):
+            if attempt > 0 and rows:
+                break
+            query = base_query
+            params: list = [*insee_codes, lo, hi]
 
-        query += " ORDER BY date_etablissement_dpe DESC LIMIT ?"
-        params.append(limit * 3)  # Marge car on filtre les coords invalides
+            use_energy = (attempt == 0)
+            use_ges = (attempt < 2)
 
-        rows = con.execute(query, params).fetchall()
+            if dpe_label:
+                query += " AND etiquette_dpe = ?"
+                params.append(dpe_label)
+            if ges_label and use_ges:
+                query += " AND etiquette_ges = ?"
+                params.append(ges_label)
+            if dpe_date:
+                query += " AND date_etablissement_dpe = ?"
+                params.append(dpe_date)
+            if use_energy and conso_ep is not None and has_conso:
+                delta_c = conso_ep * tolerance_pct / 100.0
+                query += " AND conso_5_usages_par_m2_ep BETWEEN ? AND ?"
+                params.extend([conso_ep - delta_c, conso_ep + delta_c])
+            if use_energy and ges_ep is not None and has_ges_ep:
+                delta_g = ges_ep * tolerance_pct / 100.0
+                query += ' AND "emission_ges_5_usages par_m2" BETWEEN ? AND ?'
+                params.extend([ges_ep - delta_g, ges_ep + delta_g])
+
+            query += " ORDER BY date_etablissement_dpe DESC LIMIT ?"
+            params.append(limit * 3)  # Marge car on filtre les coords invalides
+
+            rows = con.execute(query, params).fetchall()
+            if rows:
+                if attempt > 0:
+                    logger.debug(f"[dpe_positions] Résultats trouvés après relâchement (essai {attempt + 1}).")
+                break
+
     except Exception as e:
         logger.error(f"[dpe_positions] Erreur requête DPE : {e}")
         return []

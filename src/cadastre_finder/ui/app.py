@@ -33,6 +33,9 @@ st.markdown("""
   /* Retire le padding top excessif de Streamlit */
   .block-container { padding-top: 1.5rem; }
 
+  /* Supprime la scrollbar horizontale inutile de la sidebar */
+  section[data-testid="stSidebar"] { overflow-x: hidden; }
+
   /* Carte info résultat */
   .info-card {
       background: #ffffff;
@@ -52,10 +55,18 @@ st.markdown("""
       letter-spacing: 0.02em;
   }
 
+  /* Espacement vertical entre les métriques du panneau info */
+  div[data-testid="stMetric"] { margin-bottom: 0.6rem; }
+
   /* Barre de navigation résultats */
   div[data-testid="stHorizontalBlock"] > div:first-child button,
   div[data-testid="stHorizontalBlock"] > div:last-child button {
       width: 100%;
+  }
+
+  /* Petit écran : empile info sous la carte */
+  @media (max-width: 900px) {
+    div[data-testid="column"] { min-width: 100% !important; }
   }
 </style>
 """, unsafe_allow_html=True)
@@ -207,7 +218,7 @@ def _display_result(
 
     st.write("")
 
-    col_info, col_map = st.columns([1, 2], gap="medium")
+    col_info, col_map = st.columns([1, 2], gap="large")
 
     with col_info:
         score = result.score
@@ -320,7 +331,7 @@ def _display_result(
     with col_map:
         html = _make_mini_map(result)
         b64_html = base64.b64encode(html.encode()).decode()
-        st.iframe(src=f"data:text/html;base64,{b64_html}", height=480)
+        st.iframe(src=f"data:text/html;base64,{b64_html}", height=640)
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +357,7 @@ def _results_overview(
             border = "border:2px solid #1565c0;" if i == current_idx else "border:2px solid transparent;"
             st.markdown(
                 f"<div style='text-align:center;background:{color};color:#fff;"
-                f"border-radius:4px;padding:5px 2px;font-size:0.78rem;{border}'>"
+                f"border-radius:4px;padding:6px 4px;font-size:0.88rem;{border}'>"
                 f"{label}<br><strong>{r.score:.0f}</strong></div>",
                 unsafe_allow_html=True,
             )
@@ -399,6 +410,8 @@ def _run_search_positions(
     dpe: str | None,
     ges: str | None,
     dpe_date: str | None,
+    conso_ep: float | None,
+    ges_ep: float | None,
     postal: str | None,
     tolerance_pct: float,
     neighbor_mode: str,
@@ -422,6 +435,8 @@ def _run_search_positions(
         dpe_label=dpe,
         ges_label=ges,
         dpe_date=dpe_date,
+        conso_ep=conso_ep,
+        ges_ep=ges_ep,
         tolerance_pct=tolerance_pct,
         db_path=db_path,
     )
@@ -517,8 +532,25 @@ def _sidebar() -> dict | None:
             help="Extraite automatiquement de l'annonce si présente. Discriminant quasi-unique.",
         )
         dpe_date = dpe_date_raw.strip() or None
+
+        c3, c4 = st.sidebar.columns(2)
+        conso_ep_raw = c3.number_input(
+            "Conso. (kWh/m²/an)",
+            min_value=0, max_value=600, value=0, step=5,
+            help="Énergie primaire sur le certificat DPE. 0 = non utilisé.",
+        )
+        conso_ep: float | None = float(conso_ep_raw) if conso_ep_raw > 0 else None
+
+        ges_ep_raw = c4.number_input(
+            "CO₂ (kg/m²/an)",
+            min_value=0, max_value=200, value=0, step=1,
+            help="Émissions GES sur le certificat DPE. 0 = non utilisé.",
+        )
+        ges_ep: float | None = float(ges_ep_raw) if ges_ep_raw > 0 else None
     else:
         dpe_date = None
+        conso_ep = None
+        ges_ep = None
 
     postal = st.sidebar.text_input("Code postal", placeholder="optionnel")
 
@@ -569,6 +601,8 @@ def _sidebar() -> dict | None:
             "dpe": dpe,
             "ges": ges,
             "dpe_date": dpe_date,
+            "conso_ep": conso_ep,
+            "ges_ep": ges_ep,
             "postal": postal.strip() or None,
             "tolerance_pct": tolerance_pct,
             "neighbor_mode": neighbor_mode.value,
@@ -617,6 +651,8 @@ def main() -> None:
                     dpe=p.get("dpe"),
                     ges=p.get("ges"),
                     dpe_date=p.get("dpe_date"),
+                    conso_ep=p.get("conso_ep"),
+                    ges_ep=p.get("ges_ep"),
                     postal=p["postal"],
                     tolerance_pct=p["tolerance_pct"],
                     neighbor_mode=p["neighbor_mode"],

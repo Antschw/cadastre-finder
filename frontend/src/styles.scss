@@ -1,0 +1,36 @@
+@use '@angular/material' as mat;
+
+html {
+  height: 100%;
+  @include mat.theme(
+    (
+      color: (
+        primary: mat.$blue-palette,
+        tertiary: mat.$cyan-palette,
+      ),
+      typography: 'Google Sans',
+      density: 0,
+    )
+  );
+}
+
+body {
+  color-scheme: light;
+  background-color: #f8f9fa;
+  color: #202124;
+  font-family: 'Google Sans', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  margin: 0;
+  height: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+// Scrollbar fine style Google
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #f1f3f4; }
+::-webkit-scrollbar-thumb { background: #bdc1c6; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #80868b; }
+
+// Import Leaflet CSS
+@import 'leaflet/dist/leaflet.css';

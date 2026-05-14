@@ -229,6 +229,54 @@ def cmd_ui(args: argparse.Namespace) -> int:
     return result.returncode
 
 
+def cmd_ui_angular(args: argparse.Namespace) -> int:
+    """Lance le backend FastAPI + le serveur de dev Angular en parallèle."""
+    import subprocess
+    import sys
+    import signal
+    from pathlib import Path
+
+    frontend_dir = Path(__file__).parent.parent.parent.parent / "frontend"
+    if not frontend_dir.exists():
+        logger.error(
+            f"Dossier Angular introuvable : {frontend_dir}\n"
+            "Lancez d'abord : cd frontend && npm install"
+        )
+        return 1
+
+    api_cmd = [
+        sys.executable, "-m", "uvicorn",
+        "cadastre_finder.api.main:app",
+        "--host", "127.0.0.1",
+        "--port", str(args.api_port),
+        "--reload",
+    ]
+    ng_cmd = ["npm", "run", "start", "--", "--port", str(args.ng_port)]
+
+    logger.info(f"[ui-angular] API  → http://localhost:{args.api_port}/docs")
+    logger.info(f"[ui-angular] UI   → http://localhost:{args.ng_port}")
+
+    api_proc = subprocess.Popen(api_cmd)
+    ng_proc = subprocess.Popen(ng_cmd, cwd=str(frontend_dir), shell=True)
+
+    def _stop(sig, frame):
+        api_proc.terminate()
+        ng_proc.terminate()
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    try:
+        api_proc.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        api_proc.terminate()
+        ng_proc.terminate()
+
+    return 0
+
+
 def cmd_search_area(args: argparse.Namespace) -> int:
     from cadastre_finder.search.proximity_match import (
         search_by_proximity, NearPOI, AwayFromFeature, InCommuneOrNeighbors
@@ -412,10 +460,16 @@ def main() -> None:
     p_ext.add_argument("--no-open", action="store_true", help="Ne pas ouvrir le navigateur")
     p_ext.set_defaults(func=cmd_search_external)
 
-    # ui
+    # ui (Streamlit)
     p_ui = sub.add_parser("ui", help="Lancer l'interface graphique Streamlit")
     p_ui.add_argument("--port", type=int, default=8501, help="Port HTTP (défaut : 8501)")
     p_ui.set_defaults(func=cmd_ui)
+
+    # ui-angular (FastAPI + Angular)
+    p_ng = sub.add_parser("ui-angular", help="Lancer l'interface Angular + API FastAPI")
+    p_ng.add_argument("--api-port", type=int, default=8000, dest="api_port", help="Port API FastAPI (défaut : 8000)")
+    p_ng.add_argument("--ng-port", type=int, default=4200, dest="ng_port", help="Port Angular (défaut : 4200)")
+    p_ng.set_defaults(func=cmd_ui_angular)
 
     # search-area
     p_area = sub.add_parser("search-area", help="Recherche par contraintes géométriques (étape 3)")
