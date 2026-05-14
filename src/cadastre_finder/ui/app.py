@@ -398,8 +398,9 @@ def _run_search_positions(
     living_surface: float,
     dpe: str | None,
     ges: str | None,
+    dpe_date: str | None,
     postal: str | None,
-    tolerance_m2: float,
+    tolerance_pct: float,
     neighbor_mode: str,
     db_path_str: str,
 ) -> list[DPEPositionMatch]:
@@ -408,7 +409,6 @@ def _run_search_positions(
     from cadastre_finder.utils.geocoding import resolve_commune
 
     db_path = Path(db_path_str)
-    tolerance_pct = (tolerance_m2 / living_surface * 100.0) if living_surface > 0 else 5.0
 
     res = resolve_commune(commune, postal_code=postal, db_path=db_path)
     if not res or not res.best:
@@ -421,6 +421,7 @@ def _run_search_positions(
         living_surface=living_surface,
         dpe_label=dpe,
         ges_label=ges,
+        dpe_date=dpe_date,
         tolerance_pct=tolerance_pct,
         db_path=db_path,
     )
@@ -438,7 +439,7 @@ def _sidebar() -> dict | None:
     # --- Mode de recherche ---
     search_mode = st.sidebar.radio(
         "Mode de recherche",
-        options=["Parcelles", "Positions DPE"],
+        options=["Positions DPE", "Parcelles"],
         index=0,
         horizontal=True,
         help=(
@@ -507,14 +508,35 @@ def _sidebar() -> dict | None:
     def_ges = extracted.ges_label if extracted and extracted.ges_label else None
     ges = c2.selectbox("GES", options=[None, "A", "B", "C", "D", "E", "F", "G"], index=[None, "A", "B", "C", "D", "E", "F", "G"].index(def_ges))
 
+    if search_mode == "Positions DPE":
+        def_date = extracted.dpe_date if extracted and extracted.dpe_date else ""
+        dpe_date_raw = st.sidebar.text_input(
+            "Date DPE (AAAA-MM-JJ)",
+            value=def_date,
+            placeholder="ex : 2023-06-23  — optionnel mais précis",
+            help="Extraite automatiquement de l'annonce si présente. Discriminant quasi-unique.",
+        )
+        dpe_date = dpe_date_raw.strip() or None
+    else:
+        dpe_date = None
+
     postal = st.sidebar.text_input("Code postal", placeholder="optionnel")
 
     st.sidebar.divider()
 
-    ref_surface = living_surface if search_mode == "Positions DPE" else (surface or 5000.0)
-    tolerance_m2 = st.sidebar.number_input(
-        "Tolérance ±m²", min_value=0, max_value=5_000, value=100, step=10
-    )
+    if search_mode == "Positions DPE":
+        # Tolérance en % directement pour éviter la conversion aberrante sur surface habitable
+        tolerance_pct_val = st.sidebar.slider(
+            "Tolérance surface ±%", min_value=1, max_value=30, value=10,
+            help="10 % = ±20 m² pour 200 m² hab. Réduisez si trop de résultats.",
+        )
+        tolerance_pct = float(tolerance_pct_val)
+    else:
+        ref_surface = surface or 5000.0
+        tolerance_m2 = st.sidebar.number_input(
+            "Tolérance ±m²", min_value=0, max_value=5_000, value=100, step=10
+        )
+        tolerance_pct = (tolerance_m2 / ref_surface * 100.0) if ref_surface > 0 else 5.0
 
     neighbor_label = st.sidebar.radio(
         "Voisinage",
@@ -546,8 +568,9 @@ def _sidebar() -> dict | None:
             "living_surface": float(living_surface),
             "dpe": dpe,
             "ges": ges,
+            "dpe_date": dpe_date,
             "postal": postal.strip() or None,
-            "tolerance_m2": float(tolerance_m2),
+            "tolerance_pct": tolerance_pct,
             "neighbor_mode": neighbor_mode.value,
         }
     else:
@@ -559,7 +582,7 @@ def _sidebar() -> dict | None:
             "dpe": dpe,
             "ges": ges,
             "postal": postal.strip() or None,
-            "tolerance_m2": float(tolerance_m2),
+            "tolerance_pct": tolerance_pct,
             "neighbor_mode": neighbor_mode.value,
         }
 
@@ -593,8 +616,9 @@ def main() -> None:
                     living_surface=p["living_surface"],
                     dpe=p.get("dpe"),
                     ges=p.get("ges"),
+                    dpe_date=p.get("dpe_date"),
                     postal=p["postal"],
-                    tolerance_m2=p["tolerance_m2"],
+                    tolerance_pct=p["tolerance_pct"],
                     neighbor_mode=p["neighbor_mode"],
                     db_path_str=str(DB_PATH),
                 )
@@ -606,7 +630,7 @@ def main() -> None:
                     dpe=p.get("dpe"),
                     ges=p.get("ges"),
                     postal=p["postal"],
-                    tolerance_m2=p["tolerance_m2"],
+                    tolerance_m2=p.get("tolerance_pct", 5.0) / 100.0 * p["surface"],
                     neighbor_mode=p["neighbor_mode"],
                     db_path_str=str(DB_PATH),
                 )
@@ -618,7 +642,7 @@ def main() -> None:
         if p.get("mode") == "positions_dpe":
             st.warning(
                 "Aucune position DPE trouvée. Vérifiez la surface habitable, le DPE/GES, "
-                "ou élargissez le voisinage."
+                "la date DPE, ou élargissez la tolérance et le voisinage."
             )
         else:
             st.warning(

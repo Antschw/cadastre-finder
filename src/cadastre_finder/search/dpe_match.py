@@ -789,6 +789,7 @@ def search_dpe_positions(
     living_surface: float,
     dpe_label: Optional[str] = None,
     ges_label: Optional[str] = None,
+    dpe_date: Optional[str] = None,
     tolerance_pct: float = 5.0,
     limit: int = 20,
     db_path: Path = DB_PATH,
@@ -845,6 +846,9 @@ def search_dpe_positions(
         if ges_label:
             query += " AND etiquette_ges = ?"
             params.append(ges_label)
+        if dpe_date:
+            query += " AND date_etablissement_dpe = ?"
+            params.append(dpe_date)
 
         query += " ORDER BY date_etablissement_dpe DESC LIMIT ?"
         params.append(limit * 3)  # Marge car on filtre les coords invalides

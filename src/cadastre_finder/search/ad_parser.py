@@ -13,6 +13,7 @@ class SearchCriteria:
     living_surface: Optional[float] = None
     dpe_label: Optional[str] = None
     ges_label: Optional[str] = None
+    dpe_date: Optional[str] = None
     commune: Optional[str] = None
 
 
@@ -47,5 +48,11 @@ def parse_ad_text(text: str) -> SearchCriteria:
     ges_match = re.search(r"(?i)(?:GES|classe climat)\s*[:\s]*([A-G])(?:\s|$|\W)", text)
     if ges_match:
         criteria.ges_label = ges_match.group(1).upper()
+
+    # 5. Date DPE (ex: "Date du DPE : 23/06/2023")
+    date_match = re.search(r"(?i)date\s+du\s+dpe\s*[:\s]*(\d{2})/(\d{2})/(\d{4})", text)
+    if date_match:
+        d, m, y = date_match.groups()
+        criteria.dpe_date = f"{y}-{m}-{d}"
 
     return criteria
