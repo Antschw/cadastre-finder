@@ -25,8 +25,7 @@ htmlcov/
 *.iml
 
 # Sorties
-output/
-*.html
+out/
 
 # Notebooks checkpoints
 .ipynb_checkpoints/
