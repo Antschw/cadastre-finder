@@ -98,6 +98,7 @@ def cmd_build_adjacency(args: argparse.Namespace) -> int:
     build_adjacency_table(
         db_path=Path(args.db),
         include_rank2=not args.no_rank2,
+        include_rank3=not args.no_rank3,
         force=args.force,
     )
     return 0
@@ -179,6 +180,42 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_search_external(args: argparse.Namespace) -> int:
+    """Recherche via API publiques (IGN Apicarto + ADEME) pour tout département français."""
+    from cadastre_finder.search.external_search import search_external
+    from cadastre_finder.out.map import render_results
+
+    commune = args.commune
+    surface = args.surface
+
+    results = search_external(
+        commune=commune,
+        surface_m2=surface,
+        living_surface=getattr(args, "living_surface", None),
+        dpe_label=getattr(args, "dpe", None),
+        ges_label=getattr(args, "ges", None),
+        postal_code=getattr(args, "postal", None),
+        tolerance_pct=args.tolerance,
+    )
+
+    if not results:
+        logger.warning("Aucun résultat via API publiques.")
+        return 0
+
+    output_path = OUTPUT_DIR / f"result_ext_{commune.replace(' ', '_')}.html"
+    from cadastre_finder.search.models import ParcelMatch, ComboMatch
+    matches = [r for r in results if isinstance(r, ParcelMatch)]
+    combos = [r for r in results if isinstance(r, ComboMatch)]
+    render_results(
+        matches,
+        output_path=output_path,
+        combos=combos,
+        query_info={"commune": commune, "surface_m2": surface, "titre": "Résultats externes (API publiques)"},
+        auto_open=not args.no_open,
+    )
+    return 0
+
+
 def cmd_ui(args: argparse.Namespace) -> int:
     import subprocess
     import sys
@@ -190,6 +227,54 @@ def cmd_ui(args: argparse.Namespace) -> int:
     logger.info(f"[ui] Démarrage de l'interface sur http://localhost:{port}")
     result = subprocess.run(cmd)
     return result.returncode
+
+
+def cmd_ui_angular(args: argparse.Namespace) -> int:
+    """Lance le backend FastAPI + le serveur de dev Angular en parallèle."""
+    import subprocess
+    import sys
+    import signal
+    from pathlib import Path
+
+    frontend_dir = Path(__file__).parent.parent.parent.parent / "frontend"
+    if not frontend_dir.exists():
+        logger.error(
+            f"Dossier Angular introuvable : {frontend_dir}\n"
+            "Lancez d'abord : cd frontend && npm install"
+        )
+        return 1
+
+    api_cmd = [
+        sys.executable, "-m", "uvicorn",
+        "cadastre_finder.api.main:app",
+        "--host", "127.0.0.1",
+        "--port", str(args.api_port),
+        "--reload",
+    ]
+    ng_cmd = ["npm", "run", "start", "--", "--port", str(args.ng_port)]
+
+    logger.info(f"[ui-angular] API  → http://localhost:{args.api_port}/docs")
+    logger.info(f"[ui-angular] UI   → http://localhost:{args.ng_port}")
+
+    api_proc = subprocess.Popen(api_cmd)
+    ng_proc = subprocess.Popen(ng_cmd, cwd=str(frontend_dir), shell=True)
+
+    def _stop(sig, frame):
+        api_proc.terminate()
+        ng_proc.terminate()
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    try:
+        api_proc.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        api_proc.terminate()
+        ng_proc.terminate()
+
+    return 0
 
 
 def cmd_search_area(args: argparse.Namespace) -> int:
@@ -319,6 +404,7 @@ def main() -> None:
     # build-adjacency
     p_adj = sub.add_parser("build-adjacency", help="Calcul table d'adjacence communes")
     p_adj.add_argument("--no-rank2", action="store_true", help="Ne pas calculer le rang 2")
+    p_adj.add_argument("--no-rank3", action="store_true", help="Ne pas calculer le rang 3")
     p_adj.add_argument("--force", action="store_true", help="Supprimer et reconstruire même si déjà présent")
     p_adj.set_defaults(func=cmd_build_adjacency)
 
@@ -355,10 +441,35 @@ def main() -> None:
     p_search.add_argument("--no-open", action="store_true", help="Ne pas ouvrir le navigateur")
     p_search.set_defaults(func=cmd_search)
 
-    # ui
+    # search-external
+    p_ext = sub.add_parser(
+        "search-external",
+        help="Recherche via API publiques (IGN + ADEME) — tout département français",
+    )
+    p_ext.add_argument("--commune", required=True, help="Nom de la commune")
+    p_ext.add_argument("--surface", type=float, required=True, help="Surface terrain en m²")
+    p_ext.add_argument("--living-surface", type=float, dest="living_surface",
+                       help="Surface habitable en m²")
+    p_ext.add_argument("--dpe", choices=["A", "B", "C", "D", "E", "F", "G"],
+                       help="Étiquette DPE")
+    p_ext.add_argument("--ges", choices=["A", "B", "C", "D", "E", "F", "G"],
+                       help="Étiquette GES")
+    p_ext.add_argument("--postal", help="Code postal (pour désambiguïser la commune)")
+    p_ext.add_argument("--tolerance", type=float, default=10.0,
+                       help="Tolérance surface en pourcent (défaut : 10)")
+    p_ext.add_argument("--no-open", action="store_true", help="Ne pas ouvrir le navigateur")
+    p_ext.set_defaults(func=cmd_search_external)
+
+    # ui (Streamlit)
     p_ui = sub.add_parser("ui", help="Lancer l'interface graphique Streamlit")
     p_ui.add_argument("--port", type=int, default=8501, help="Port HTTP (défaut : 8501)")
     p_ui.set_defaults(func=cmd_ui)
+
+    # ui-angular (FastAPI + Angular)
+    p_ng = sub.add_parser("ui-angular", help="Lancer l'interface Angular + API FastAPI")
+    p_ng.add_argument("--api-port", type=int, default=8000, dest="api_port", help="Port API FastAPI (défaut : 8000)")
+    p_ng.add_argument("--ng-port", type=int, default=4200, dest="ng_port", help="Port Angular (défaut : 4200)")
+    p_ng.set_defaults(func=cmd_ui_angular)
 
     # search-area
     p_area = sub.add_parser("search-area", help="Recherche par contraintes géométriques (étape 3)")

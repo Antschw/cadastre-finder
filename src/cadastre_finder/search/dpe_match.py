@@ -17,9 +17,13 @@ from loguru import logger
 from shapely.geometry import shape
 from shapely.ops import unary_union
 
+from pyproj import Transformer
+
 from cadastre_finder.config import DB_PATH, DPE_TABLE
-from cadastre_finder.search.models import ComboMatch, ParcelMatch
+from cadastre_finder.search.models import ComboMatch, DPEPositionMatch, ParcelMatch
 from cadastre_finder.utils.geocoding import geocode_address, reverse_geocode_parcel
+
+_lambert93_to_wgs84 = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
 
 
 _MAX_AGGREGATE_PARTS = 6
@@ -194,8 +198,8 @@ def _fetch_best_anchor(
 
     # Fallback API
     logger.debug(f"[dpe_match] Pas d'ancre locale idéale pour ({lat}, {lon}), appel API...")
-    parcel_id = reverse_geocode_parcel(lat, lon)
-    if parcel_id:
+    parcel_ids = reverse_geocode_parcel(lat, lon)
+    for parcel_id in parcel_ids:
         anchor = _fetch_parcel_by_id(con, parcel_id, dpe_record)
         if anchor:
             return anchor
@@ -305,6 +309,119 @@ def _fetch_parcel_at_point(
         dpe_label=dpe_record.get("dpe"),
         ges_label=dpe_record.get("ges"),
     )
+
+
+def _fetch_local_pool(
+    con: duckdb.DuckDBPyConnection,
+    lat: float,
+    lon: float,
+    insee: Optional[str],
+    radius_m: float = 100.0,
+) -> list[tuple]:
+    """Récupère toutes les parcelles dans un rayon donné autour d'un point (en mètres).
+
+    Utilise ST_Buffer en degrés (~0.001° ≈ 100m en France) pour le filtre spatial,
+    puis calcule la distance réelle en Lambert93 pour le tri et le seuillage.
+    """
+    approx_deg = radius_m / 111_000.0
+    rows = con.execute("""
+        SELECT id, code_insee, contenance,
+               ST_X(ST_Centroid(geometry)) AS clon,
+               ST_Y(ST_Centroid(geometry)) AS clat,
+               ST_AsGeoJSON(geometry) AS geojson,
+               ST_Distance(
+                   ST_Transform(ST_FlipCoordinates(ST_Point(?, ?)), 'EPSG:4326', 'EPSG:2154'),
+                   ST_Transform(ST_FlipCoordinates(geometry), 'EPSG:4326', 'EPSG:2154')
+               ) AS dist_m
+        FROM parcelles
+        WHERE ST_Intersects(geometry, ST_Buffer(ST_Point(?, ?), ?))
+          AND (code_insee = ? OR ? IS NULL)
+        ORDER BY dist_m
+    """, [lon, lat, lon, lat, approx_deg, insee, insee]).fetchall()
+    return [r for r in rows if r[6] <= radius_m]
+
+
+def _is_connected(geoms: list) -> bool:
+    """Vérifie si une liste de géométries Shapely forme un seul bloc contigu (BFS)."""
+    if not geoms:
+        return False
+    if len(geoms) == 1:
+        return True
+
+    n = len(geoms)
+    adj: dict[int, set[int]] = {i: set() for i in range(n)}
+    for i in range(n):
+        for j in range(i + 1, n):
+            if geoms[i].intersects(geoms[j]):
+                adj[i].add(j)
+                adj[j].add(i)
+
+    visited = {0}
+    queue = list(adj[0])
+    while queue:
+        curr = queue.pop(0)
+        if curr not in visited:
+            visited.add(curr)
+            queue.extend(adj[curr] - visited)
+    return len(visited) == n
+
+
+def _find_micro_combos_in_pool(
+    con: duckdb.DuckDBPyConnection,
+    pool: list[tuple],
+    target_terrain: float,
+    tolerance_pct: float,
+    dpe_record: dict,
+    max_parts: int = 4,
+) -> list[ComboMatch]:
+    """Cherche des combinaisons contiguës de parcelles dans le pool local.
+
+    Pré-parse les géométries une seule fois, filtre par surface puis par
+    contiguïté spatiale (Shapely) avant de construire le ComboMatch.
+    Parcourt tous les k sans s'arrêter au premier k fructueux : une combinaison
+    de plus petites parcelles (k=3+) peut être plus précise qu'une paire à k=2.
+    Priorité aux combos contenant la parcelle la plus proche du point géocodé (pool[0]).
+    """
+    from itertools import combinations as _combinations
+
+    delta = target_terrain * tolerance_pct / 100.0
+    lo, hi = target_terrain - delta, target_terrain + delta
+    found: list[ComboMatch] = []
+    # ID de la parcelle la plus proche du point DPE géocodé (pool trié par dist_m)
+    nearest_id = pool[0][0] if pool else None
+
+    # Pré-parser les géométries Shapely une seule fois (r[5] = GeoJSON)
+    parsed_geoms: list[Optional[object]] = []
+    for r in pool:
+        try:
+            parsed_geoms.append(shape(json.loads(r[5])))
+        except Exception:
+            parsed_geoms.append(None)
+
+    for k in range(2, min(max_parts + 1, len(pool) + 1)):
+        for idx_combo in _combinations(range(len(pool)), k):
+            total = sum(pool[i][2] for i in idx_combo)
+            if not (lo <= total <= hi):
+                continue
+            geoms = [parsed_geoms[i] for i in idx_combo if parsed_geoms[i] is not None]
+            if len(geoms) != k or not _is_connected(geoms):
+                continue
+            ids = [pool[i][0] for i in idx_combo]
+            full = _fetch_parcels_bulk(con, ids)
+            parts = [full[pid] for pid in ids if pid in full]
+            if parts:
+                found.append(_build_combo_from_parts(parts, dpe_record))
+
+    if not found:
+        return []
+
+    # Priorité aux combos contenant la parcelle la plus proche du point DPE géocodé,
+    # puis par précision de surface (delta absolu)
+    found.sort(key=lambda c: (
+        0 if nearest_id and any(p.id_parcelle == nearest_id for p in c.parts) else 1,
+        abs(c.total_contenance - target_terrain),
+    ))
+    return found[:5]
 
 
 def _fetch_neighbor_ids(con: duckdb.DuckDBPyConnection, parcel_id: str) -> list[str]:
@@ -570,6 +687,26 @@ def find_parcel_for_dpe_record(
     try:
         con.execute("LOAD spatial;")
 
+        # --- Phase 1 : Filet de pêche local ---
+        pool = _fetch_local_pool(con, lat, lon, dpe_record.get("code_insee"))
+
+        if pool and target_terrain is not None:
+            delta = target_terrain * tolerance_pct / 100.0
+            lo, hi = target_terrain - delta, target_terrain + delta
+
+            # Cherche d'abord une parcelle unique dans le pool
+            for r in pool:
+                if lo <= r[2] <= hi:
+                    logger.debug(f"[dpe_match] Match direct dans le pool : {r[2]}m2")
+                    return [_row_to_parcel_match(con, r, dpe_record)]
+
+            # Micro-combos dans le pool
+            combos = _find_micro_combos_in_pool(con, pool, target_terrain, tolerance_pct, dpe_record)
+            if combos:
+                logger.debug(f"[dpe_match] {len(combos)} micro-combo(s) trouvé(s) dans le pool.")
+                return combos
+
+        # --- Phase 2 : Fallback ancre + BFS ---
         anchor = _fetch_best_anchor(con, lat, lon, dpe_record)
         if anchor is None:
             return []
@@ -580,28 +717,23 @@ def find_parcel_for_dpe_record(
         delta = target_terrain * tolerance_pct / 100.0
         lo, hi = target_terrain - delta, target_terrain + delta
 
-        # Parcelle ancre déjà dans la fenêtre cible
         if lo <= anchor.contenance <= hi:
             return [anchor]
 
-        # Parcelle ancre plus petite → tenter agrégation
         if anchor.contenance < lo:
-            # On tente plusieurs niveaux de relâchement pour l'agrégation
             for attempt in range(3):
                 current_tol = tolerance_pct
                 if attempt == 1:
-                    current_tol = max(tolerance_pct, 5.0)  # min 5%
+                    current_tol = max(tolerance_pct, 5.0)
                 elif attempt == 2:
-                    current_tol = max(tolerance_pct, 15.0) # min 15%
-
+                    current_tol = max(tolerance_pct, 15.0)
                 combos = _aggregate_around(con, anchor, target_terrain, current_tol, dpe_record)
                 if combos:
                     logger.debug(
-                        f"[dpe_match] {len(combos)} combo(s) trouvé(s) pour {target_terrain}m2 "
+                        f"[dpe_match] {len(combos)} combo(s) BFS trouvé(s) pour {target_terrain}m2 "
                         f"(essai: {attempt+1})"
                     )
                     return combos
-
                 if attempt == 2:
                     break
 
@@ -658,6 +790,275 @@ def dpe_led_search(
 
     logger.info(f"[dpe_match] {len(matches)} parcelle(s)/combo(s) localisé(s) via DPE.")
     return matches
+
+
+# ---------------------------------------------------------------------------
+# Recherche directe de positions DPE (sans matching parcellaire)
+# ---------------------------------------------------------------------------
+
+def _query_api_positions(
+    scope_rang: dict[str, int],
+    living_surface: float,
+    dpe_label: Optional[str],
+    ges_label: Optional[str],
+    dpe_date: Optional[str],
+    tolerance_pct: float,
+    limit: int,
+) -> list[DPEPositionMatch]:
+    """Interroge l'API ADEME Open Data et convertit les résultats en DPEPositionMatch.
+
+    Itère sur chaque commune du scope. Applique le filtre dpe_date côté Python
+    (l'API Elasticsearch ne supporte pas ce filtre directement).
+    Retourne une liste vide si l'API est indisponible ou retourne 0 résultat.
+    """
+    from cadastre_finder.search.external_search import _query_ademe_api
+
+    # Tentatives progressives : plein → sans GES → sans DPE ni GES
+    label_attempts = [(dpe_label, ges_label)]
+    if dpe_label or ges_label:
+        label_attempts.append((dpe_label, None))
+        label_attempts.append((None, None))
+
+    all_records: list[DPEPositionMatch] = []
+    seen_addresses: set[str] = set()
+
+    for attempt_idx, (try_dpe, try_ges) in enumerate(label_attempts):
+        if attempt_idx > 0 and all_records:
+            break
+        if attempt_idx > 0:
+            logger.debug(
+                f"[dpe_positions/api] Relâchement essai {attempt_idx + 1} : "
+                f"dpe={try_dpe}, ges={try_ges}"
+            )
+
+        for insee_code, rank in scope_rang.items():
+            raw = _query_ademe_api(
+                insee_code=insee_code,
+                living_surface=living_surface,
+                dpe_label=try_dpe,
+                ges_label=try_ges,
+                tolerance_pct=tolerance_pct,
+                limit=limit * 3,
+            )
+            for rec in raw:
+                # Filtre date côté Python (l'API ne le supporte pas)
+                if dpe_date and rec.get("date") and str(rec["date"])[:10] != dpe_date:
+                    continue
+
+                lat, lon = None, None
+
+                # Priorité : _geopoint WGS84 natif (lat,lon)
+                if rec.get("geopoint"):
+                    try:
+                        parts = str(rec["geopoint"]).split(",")
+                        if len(parts) == 2:
+                            lat_t, lon_t = float(parts[0]), float(parts[1])
+                            if 41.0 <= lat_t <= 51.5 and -5.5 <= lon_t <= 10.0:
+                                lat, lon = lat_t, lon_t
+                    except Exception:
+                        pass
+
+                # Fallback : coordonnées Lambert93 BAN
+                if lat is None and rec.get("coord_x") and rec.get("coord_y"):
+                    try:
+                        lon_t, lat_t = _lambert93_to_wgs84.transform(
+                            float(rec["coord_x"]), float(rec["coord_y"])
+                        )
+                        if 41.0 <= lat_t <= 51.5 and -5.5 <= lon_t <= 10.0:
+                            lat, lon = lat_t, lon_t
+                    except Exception:
+                        pass
+
+                if lat is None:
+                    continue
+
+                address = rec.get("address") or ""
+                key = f"{address}|{rec.get('code_insee', '')}"
+                if key in seen_addresses:
+                    continue
+                seen_addresses.add(key)
+
+                surface = float(rec["surface"]) if rec.get("surface") is not None else 0.0
+                score = max(0.0, 100.0 - abs(surface - living_surface) / living_surface * 100.0) - rank * 3
+
+                all_records.append(DPEPositionMatch(
+                    address=address,
+                    postcode=rec.get("postcode") or "",
+                    city=rec.get("city") or "",
+                    code_insee=rec.get("code_insee") or "",
+                    surface_habitable=surface,
+                    dpe_label=rec.get("dpe"),
+                    ges_label=rec.get("ges"),
+                    date=str(rec["date"])[:10] if rec.get("date") else None,
+                    centroid_lat=lat,
+                    centroid_lon=lon,
+                    score=round(score, 1),
+                    rank=rank,
+                ))
+
+        if all_records:
+            break
+
+    all_records.sort(key=lambda m: m.score, reverse=True)
+    logger.info(f"[dpe_positions/api] {len(all_records)} position(s) DPE trouvée(s) via API ADEME.")
+    return all_records[:limit]
+
+
+def search_dpe_positions(
+    scope_rang: dict[str, int],
+    living_surface: float,
+    dpe_label: Optional[str] = None,
+    ges_label: Optional[str] = None,
+    dpe_date: Optional[str] = None,
+    conso_ep: Optional[float] = None,
+    ges_ep: Optional[float] = None,
+    tolerance_pct: float = 5.0,
+    limit: int = 20,
+    db_path: Path = DB_PATH,
+) -> list[DPEPositionMatch]:
+    """Retourne directement les positions GPS des enregistrements DPE correspondants.
+
+    Interroge d'abord l'API ADEME Open Data (toujours à jour) puis bascule sur la
+    base locale si l'API retourne 0 résultat. Les filtres kWh/CO₂ (conso_ep, ges_ep)
+    s'appliquent uniquement via la base locale (l'API ne les expose pas).
+    """
+    if not scope_rang or living_surface <= 0:
+        return []
+
+    # --- Phase 1 : API ADEME (prioritaire) ---
+    api_hits = _query_api_positions(
+        scope_rang=scope_rang,
+        living_surface=living_surface,
+        dpe_label=dpe_label,
+        ges_label=ges_label,
+        dpe_date=dpe_date,
+        tolerance_pct=tolerance_pct,
+        limit=limit,
+    )
+    if api_hits:
+        return api_hits
+
+    # --- Phase 2 : fallback base locale ---
+    logger.info("[dpe_positions] API ADEME sans résultat — basculement base locale.")
+    insee_codes = list(scope_rang.keys())
+    delta = living_surface * tolerance_pct / 100.0
+    lo, hi = living_surface - delta, living_surface + delta
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        table_exists = con.execute(
+            f"SELECT count(*) FROM information_schema.tables WHERE table_name = '{DPE_TABLE}'"
+        ).fetchone()[0]
+        if not table_exists:
+            logger.warning(f"Table {DPE_TABLE} absente. Lancez l'ingestion DPE.")
+            return []
+
+        cols = {r[0].lower() for r in con.execute(f"DESCRIBE {DPE_TABLE}").fetchall()}
+        has_coords = (
+            "coordonnee_cartographique_x_ban" in cols
+            and "coordonnee_cartographique_y_ban" in cols
+        )
+        if not has_coords:
+            logger.warning("[dpe_positions] Colonnes de coordonnées BAN absentes de la table DPE.")
+            return []
+
+        has_conso = "conso_5_usages_par_m2_ep" in cols
+        has_ges_ep = "emission_ges_5_usages par_m2" in cols
+
+        placeholders = ", ".join("?" * len(insee_codes))
+        base_query = f"""
+            SELECT
+                adresse_brut, code_postal_brut, nom_commune_brut, code_insee_ban,
+                surface_habitable_logement, etiquette_dpe, etiquette_ges,
+                date_etablissement_dpe,
+                coordonnee_cartographique_x_ban, coordonnee_cartographique_y_ban
+            FROM {DPE_TABLE}
+            WHERE code_insee_ban IN ({placeholders})
+              AND surface_habitable_logement BETWEEN ? AND ?
+              AND coordonnee_cartographique_x_ban IS NOT NULL
+              AND coordonnee_cartographique_y_ban IS NOT NULL
+        """
+
+        # Relâchement progressif : essai 0=tout, essai 1=sans conso/ges_ep, essai 2=sans GES
+        rows: list = []
+        for attempt in range(3):
+            if attempt > 0 and rows:
+                break
+            query = base_query
+            params: list = [*insee_codes, lo, hi]
+
+            use_energy = (attempt == 0)
+            use_ges = (attempt < 2)
+
+            if dpe_label:
+                query += " AND etiquette_dpe = ?"
+                params.append(dpe_label)
+            if ges_label and use_ges:
+                query += " AND etiquette_ges = ?"
+                params.append(ges_label)
+            if dpe_date:
+                query += " AND date_etablissement_dpe = ?"
+                params.append(dpe_date)
+            if use_energy and conso_ep is not None and has_conso:
+                delta_c = conso_ep * tolerance_pct / 100.0
+                query += " AND conso_5_usages_par_m2_ep BETWEEN ? AND ?"
+                params.extend([conso_ep - delta_c, conso_ep + delta_c])
+            if use_energy and ges_ep is not None and has_ges_ep:
+                delta_g = ges_ep * tolerance_pct / 100.0
+                query += ' AND "emission_ges_5_usages par_m2" BETWEEN ? AND ?'
+                params.extend([ges_ep - delta_g, ges_ep + delta_g])
+
+            query += " ORDER BY date_etablissement_dpe DESC LIMIT ?"
+            params.append(limit * 3)  # Marge car on filtre les coords invalides
+
+            rows = con.execute(query, params).fetchall()
+            if rows:
+                if attempt > 0:
+                    logger.debug(f"[dpe_positions] Résultats trouvés après relâchement (essai {attempt + 1}).")
+                break
+
+    except Exception as e:
+        logger.error(f"[dpe_positions] Erreur requête DPE : {e}")
+        return []
+    finally:
+        con.close()
+
+    results: list[DPEPositionMatch] = []
+    for r in rows:
+        x_ban, y_ban = r[8], r[9]
+        try:
+            lon, lat = _lambert93_to_wgs84.transform(float(x_ban), float(y_ban))
+        except Exception:
+            continue
+        # Coordonnées hors France métropolitaine → ignorer
+        if not (41.0 <= lat <= 51.5 and -5.5 <= lon <= 10.0):
+            continue
+
+        surface = r[4] or 0.0
+        rank = scope_rang.get(r[3], 0)
+        score = max(0.0, 100.0 - abs(surface - living_surface) / living_surface * 100.0) - rank * 3
+
+        results.append(DPEPositionMatch(
+            address=r[0] or "",
+            postcode=r[1] or "",
+            city=r[2] or "",
+            code_insee=r[3] or "",
+            surface_habitable=surface,
+            dpe_label=r[5],
+            ges_label=r[6],
+            date=str(r[7]) if r[7] else None,
+            centroid_lat=lat,
+            centroid_lon=lon,
+            score=round(score, 1),
+            rank=rank,
+        ))
+
+        if len(results) >= limit:
+            break
+
+    results.sort(key=lambda m: m.score, reverse=True)
+    logger.info(f"[dpe_positions] {len(results)} position(s) DPE trouvée(s).")
+    return results
 
 
 # ---------------------------------------------------------------------------

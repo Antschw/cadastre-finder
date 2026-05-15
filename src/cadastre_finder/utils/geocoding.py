@@ -146,9 +146,12 @@ def _search_api(
         if isinstance(code_insee, list) and code_insee:
             code_insee = code_insee[0]
 
-        nom = props.get("city", "")
+        nom = props.get("city", "") or props.get("name", "") or props.get("label", "")
         if isinstance(nom, list) and nom:
             nom = nom[0]
+        # Géoplateforme renvoie parfois "Commune (CP)" dans label — ne garder que le nom
+        if nom and "(" in nom:
+            nom = nom.split("(")[0].strip()
 
         score = props.get("score", 0.0)
         code_dept = code_insee[:2] if len(code_insee) >= 2 else ""
@@ -200,23 +203,27 @@ def geocode_address(
     return None
 
 
-def reverse_geocode_parcel(lat: float, lon: float) -> Optional[str]:
-    """Trouve l'ID de la parcelle cadastrale aux coordonnées données via l'API Géoplateforme."""
+def reverse_geocode_parcel(lat: float, lon: float) -> list[str]:
+    """Retourne jusqu'à 5 IDs de parcelles cadastrales proches des coordonnées données."""
     params = {
         "lat": lat,
         "lon": lon,
         "index": "parcel",
-        "limit": 1,
+        "limit": 5,
+        "returntruegeometry": "true",
     }
     try:
         resp = httpx.get(f"{GEOPF_API_URL}/reverse", params=params, timeout=5)
         resp.raise_for_status()
         data = resp.json()
-        if data.get("features"):
-            return data["features"][0]["properties"].get("id")
+        return [
+            f["properties"]["id"]
+            for f in data.get("features", [])
+            if f.get("properties", {}).get("id")
+        ]
     except Exception as e:
         logger.debug(f"[geocoding] Erreur reverse geocoding parcelle ({lat}, {lon}) : {e}")
-    return None
+    return []
 
 
 def resolve_commune(
@@ -228,23 +235,35 @@ def resolve_commune(
 
     1. Recherche locale dans la table communes DuckDB
     2. Sinon, fallback sur la Géoplateforme
-    3. Retourne un ResolveResult avec la liste des candidats triés par score
+    3. Si name est vide et postal_code fourni, résolution par code postal via Géoplateforme
+    4. Retourne un ResolveResult avec la liste des candidats triés par score
 
     Exemples :
         >>> r = resolve_commune("Mortagne-au-Perche")
         >>> r.unique.code_insee
         '61293'
     """
-    local = _search_local(name, postal_code, db_path)
+    clean_name = (name or "").strip()
+
+    if not clean_name:
+        if not postal_code:
+            return ResolveResult()
+        logger.info(f"[geocoding] Résolution par code postal uniquement : {postal_code}")
+        api_results = _search_api(postal_code, postal_code)
+        if not api_results:
+            logger.warning(f"[geocoding] Aucune commune trouvée pour le code postal '{postal_code}'")
+        return ResolveResult(candidates=api_results)
+
+    local = _search_local(clean_name, postal_code, db_path)
     if local:
-        logger.debug(f"[geocoding] '{name}' → {len(local)} résultat(s) local/locaux")
+        logger.debug(f"[geocoding] '{clean_name}' → {len(local)} résultat(s) local/locaux")
         return ResolveResult(candidates=local)
 
-    logger.info(f"[geocoding] '{name}' non trouvé localement, interrogation Géoplateforme...")
-    api_results = _search_api(name, postal_code)
+    logger.info(f"[geocoding] '{clean_name}' non trouvé localement, interrogation Géoplateforme...")
+    api_results = _search_api(clean_name, postal_code)
 
     if not api_results:
-        logger.warning(f"[geocoding] Aucun résultat pour '{name}'")
+        logger.warning(f"[geocoding] Aucun résultat pour '{clean_name}'")
         return ResolveResult()
 
     return ResolveResult(candidates=api_results)

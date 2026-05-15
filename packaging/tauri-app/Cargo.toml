@@ -1,0 +1,30 @@
+[package]
+name = "cadastre-finder"
+version = "1.0.0"
+description = "Cadastre Finder — Localisation de parcelles cadastrales"
+authors = ["Antsch"]
+edition = "2021"
+
+[[bin]]
+name = "cadastre-finder"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-opener = "2"
+tauri-plugin-window-state = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+# Aucune dépendance système supplémentaire : WebView2 est inclus dans Windows 11
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

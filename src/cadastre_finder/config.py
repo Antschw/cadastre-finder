@@ -1,7 +1,20 @@
 """Configuration centrale du projet cadastre-finder."""
+import os
+import sys
 from pathlib import Path
 
-ROOT_DIR = Path(__file__).parent.parent.parent
+
+def _resolve_root() -> Path:
+    # Mode portable (PyInstaller) : l'exe est dans backend/, data/ est au niveau parent
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent.parent
+    # Variable d'environnement explicite (tests / CI)
+    if env_data := os.environ.get("CADASTRE_DATA_DIR"):
+        return Path(env_data).parent
+    return Path(__file__).parent.parent.parent
+
+
+ROOT_DIR = _resolve_root()
 
 # Répertoires
 DATA_RAW = ROOT_DIR / "data" / "raw"
@@ -46,6 +59,9 @@ DEPARTMENTS = [
 # URLs sources
 CADASTRE_BASE_URL = "https://cadastre.data.gouv.fr/data/etalab-cadastre"
 GEOPF_API_URL = "https://data.geopf.fr/geocodage"
+# Dataset national "DPE Logements existants depuis juillet 2021" (meg-83tjwtg8dyz4vv7h1dqe)
+ADEME_API_URL = "https://data.ademe.fr/data-fair/api/v1/datasets/meg-83tjwtg8dyz4vv7h1dqe"
+IGN_APICARTO_URL = "https://apicarto.ign.fr/api/cadastre"
 
 # Projections
 CRS_LAMBERT93 = "EPSG:2154"

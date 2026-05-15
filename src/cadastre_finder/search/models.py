@@ -11,6 +11,8 @@ class NeighborMode(str, Enum):
     NONE = "none"      # commune principale uniquement
     RANK1 = "rank1"    # principale + voisines directes
     RANK2 = "rank2"    # principale + rang 1 + rang 2
+    RANK3 = "rank3"    # principale + rang 1 + rang 2 + rang 3
+    DEPT = "dept"      # toutes les communes du même département (mode DPE uniquement)
 
 
 @dataclass
@@ -41,7 +43,16 @@ class ParcelMatch:
         return (
             f"https://www.geoportail.gouv.fr/carte?"
             f"c={self.centroid_lon},{self.centroid_lat}&z=17"
-            f"&l0=GEOGRAPHICALGRIDSYSTEMS.MAPS"
+            f"&l0=ORTHOIMAGERY.ORTHOPHOTOS::GEOPORTAIL:OGC:WMTS(1)"
+            f"&l1=CADASTRALPARCELS.PARCELLAIRE_EXPRESS::GEOPORTAIL:OGC:WMTS(0.7)"
+            f"&permalink=yes"
+        )
+
+    @property
+    def google_maps_url(self) -> str:
+        return (
+            f"https://www.google.com/maps/@{self.centroid_lat},{self.centroid_lon}"
+            f",17z/data=!3m1!1e3"
         )
 
 
@@ -84,5 +95,48 @@ class ComboMatch:
         return (
             f"https://www.geoportail.gouv.fr/carte?"
             f"c={self.centroid_lon},{self.centroid_lat}&z=17"
-            f"&l0=GEOGRAPHICALGRIDSYSTEMS.MAPS"
+            f"&l0=ORTHOIMAGERY.ORTHOPHOTOS::GEOPORTAIL:OGC:WMTS(1)"
+            f"&l1=CADASTRALPARCELS.PARCELLAIRE_EXPRESS::GEOPORTAIL:OGC:WMTS(0.7)"
+            f"&permalink=yes"
+        )
+
+    @property
+    def google_maps_url(self) -> str:
+        return (
+            f"https://www.google.com/maps/@{self.centroid_lat},{self.centroid_lon}"
+            f",17z/data=!3m1!1e3"
+        )
+
+
+@dataclass
+class DPEPositionMatch:
+    """Résultat d'une recherche en mode Positions DPE : position GPS depuis la base ADEME."""
+    address: str
+    postcode: str
+    city: str
+    code_insee: str
+    surface_habitable: float
+    centroid_lat: float
+    centroid_lon: float
+    score: float = 0.0
+    rank: int = 0
+    dpe_label: Optional[str] = None
+    ges_label: Optional[str] = None
+    date: Optional[str] = None
+
+    @property
+    def geoportail_url(self) -> str:
+        return (
+            f"https://www.geoportail.gouv.fr/carte?"
+            f"c={self.centroid_lon},{self.centroid_lat}&z=17"
+            f"&l0=ORTHOIMAGERY.ORTHOPHOTOS::GEOPORTAIL:OGC:WMTS(1)"
+            f"&l1=CADASTRALPARCELS.PARCELLAIRE_EXPRESS::GEOPORTAIL:OGC:WMTS(0.7)"
+            f"&permalink=yes"
+        )
+
+    @property
+    def google_maps_url(self) -> str:
+        return (
+            f"https://www.google.com/maps/@{self.centroid_lat},{self.centroid_lon}"
+            f",17z/data=!3m1!1e3"
         )

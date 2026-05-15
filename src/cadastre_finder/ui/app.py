@@ -16,7 +16,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from cadastre_finder.config import DB_PATH
-from cadastre_finder.search.models import ComboMatch, NeighborMode, ParcelMatch
+from cadastre_finder.search.models import ComboMatch, DPEPositionMatch, NeighborMode, ParcelMatch
 
 # ---------------------------------------------------------------------------
 # Configuration de la page
@@ -32,6 +32,9 @@ st.markdown("""
 <style>
   /* Retire le padding top excessif de Streamlit */
   .block-container { padding-top: 1.5rem; }
+
+  /* Supprime la scrollbar horizontale inutile de la sidebar */
+  section[data-testid="stSidebar"] { overflow-x: hidden; }
 
   /* Carte info résultat */
   .info-card {
@@ -52,10 +55,18 @@ st.markdown("""
       letter-spacing: 0.02em;
   }
 
+  /* Espacement vertical entre les métriques du panneau info */
+  div[data-testid="stMetric"] { margin-bottom: 0.6rem; }
+
   /* Barre de navigation résultats */
   div[data-testid="stHorizontalBlock"] > div:first-child button,
   div[data-testid="stHorizontalBlock"] > div:last-child button {
       width: 100%;
+  }
+
+  /* Petit écran : empile info sous la carte */
+  @media (max-width: 900px) {
+    div[data-testid="column"] { min-width: 100% !important; }
   }
 </style>
 """, unsafe_allow_html=True)
@@ -79,7 +90,12 @@ def _score_color(score: float) -> str:
 
 
 def _rang_label(rank: int) -> str:
-    return {0: "Commune annoncée", 1: "Voisine rang 1", 2: "Voisine rang 2"}.get(rank, f"Rang {rank}")
+    return {
+        0: "Commune annoncée",
+        1: "Voisine rang 1",
+        2: "Voisine rang 2",
+        3: "Voisine rang 3",
+    }.get(rank, f"Rang {rank}")
 
 
 def _score_progress(score: float) -> float:
@@ -114,7 +130,7 @@ def _extract_commune_name(label: str) -> str:
 # Carte Folium pour un seul résultat
 # ---------------------------------------------------------------------------
 
-def _make_mini_map(result: Union[ParcelMatch, ComboMatch]) -> str:
+def _make_mini_map(result: Union[ParcelMatch, ComboMatch, DPEPositionMatch]) -> str:
     lat, lon = result.centroid_lat, result.centroid_lon
     fmap = folium.Map(location=[lat, lon], zoom_start=17, tiles="OpenStreetMap")
     folium.TileLayer(
@@ -133,7 +149,18 @@ def _make_mini_map(result: Union[ParcelMatch, ComboMatch]) -> str:
         max_zoom=19,
     ).add_to(fmap)
 
-    if isinstance(result, ComboMatch):
+    if isinstance(result, DPEPositionMatch):
+        popup_html = (
+            f"<b>{result.address}</b><br>"
+            f"{result.surface_habitable:.0f} m² hab."
+            + (f" · DPE {result.dpe_label}" if result.dpe_label else "")
+        )
+        folium.Marker(
+            location=[lat, lon],
+            popup=folium.Popup(popup_html, max_width=250),
+            icon=folium.Icon(color="blue", icon="home"),
+        ).add_to(fmap)
+    elif isinstance(result, ComboMatch):
         try:
             folium.GeoJson(
                 json.loads(result.combined_geojson),
@@ -167,7 +194,11 @@ def _make_mini_map(result: Union[ParcelMatch, ComboMatch]) -> str:
 # Affichage d'un résultat
 # ---------------------------------------------------------------------------
 
-def _display_result(result: Union[ParcelMatch, ComboMatch], idx: int, total: int) -> None:
+def _display_result(
+    result: Union[ParcelMatch, ComboMatch, DPEPositionMatch],
+    idx: int,
+    total: int,
+) -> None:
     # Navigation
     c_prev, c_counter, c_next = st.columns([1, 4, 1])
     with c_prev:
@@ -187,7 +218,7 @@ def _display_result(result: Union[ParcelMatch, ComboMatch], idx: int, total: int
 
     st.write("")
 
-    col_info, col_map = st.columns([1, 2], gap="medium")
+    col_info, col_map = st.columns([1, 2], gap="large")
 
     with col_info:
         score = result.score
@@ -202,10 +233,33 @@ def _display_result(result: Union[ParcelMatch, ComboMatch], idx: int, total: int
         st.progress(_score_progress(score))
         st.write("")
 
-        if isinstance(result, ComboMatch):
+        if isinstance(result, DPEPositionMatch):
+            st.markdown("**Position DPE** (ADEME)")
+            st.metric("Surface habitable", f"{result.surface_habitable:.0f} m²")
+            st.metric("Commune", f"{result.city} ({result.code_insee})")
+            st.metric("Adresse", result.address)
+
+            if result.dpe_label or result.ges_label:
+                c1, c2 = st.columns(2)
+                if result.dpe_label:
+                    c1.metric("DPE", result.dpe_label)
+                if result.ges_label:
+                    c2.metric("GES", result.ges_label)
+
+            if result.date:
+                st.caption(f"Date DPE : {result.date[:10] if len(result.date) >= 10 else result.date}")
+
+            st.write("")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.link_button("Géoportail", result.geoportail_url)
+            with c2:
+                st.link_button("Google Maps", result.google_maps_url)
+
+        elif isinstance(result, ComboMatch):
             st.markdown(f"**Combinaison** de {result.nb_parcelles} parcelles")
             st.metric("Surface totale", f"{result.total_contenance:,} m²")
-            
+
             # Surface bâtie cumulée
             barea = sum(p.built_area or 0 for p in result.parts)
             if barea > 0:
@@ -240,17 +294,21 @@ def _display_result(result: Union[ParcelMatch, ComboMatch], idx: int, total: int
                 )
 
             st.write("")
-            st.link_button("Ouvrir sur Géoportail", result.geoportail_url)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.link_button("Géoportail", result.geoportail_url)
+            with c2:
+                st.link_button("Google Maps", result.google_maps_url)
 
         else:
             st.markdown(f"**Parcelle** individuelle")
             st.metric("Surface", f"{result.contenance:,} m²")
-            
+
             if result.built_area and result.built_area > 0:
                 st.metric("Emprise bâtie", f"{result.built_area:.1f} m²")
 
             st.metric("Commune", f"{result.nom_commune} ({result.code_insee})")
-            
+
             # DPE / GES
             if result.dpe_label or result.ges_label:
                 c1, c2 = st.columns(2)
@@ -262,16 +320,18 @@ def _display_result(result: Union[ParcelMatch, ComboMatch], idx: int, total: int
             st.metric("Identifiant", result.id_parcelle)
 
             st.write("")
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             with c1:
                 st.link_button("Géoportail", result.geoportail_url)
             with c2:
+                st.link_button("Google Maps", result.google_maps_url)
+            with c3:
                 st.link_button("Street View", result.street_view_url)
 
     with col_map:
         html = _make_mini_map(result)
         b64_html = base64.b64encode(html.encode()).decode()
-        st.iframe(src=f"data:text/html;base64,{b64_html}", height=480)
+        st.iframe(src=f"data:text/html;base64,{b64_html}", height=640)
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +339,7 @@ def _display_result(result: Union[ParcelMatch, ComboMatch], idx: int, total: int
 # ---------------------------------------------------------------------------
 
 def _results_overview(
-    all_results: list[Union[ParcelMatch, ComboMatch]],
+    all_results: list[Union[ParcelMatch, ComboMatch, DPEPositionMatch]],
     current_idx: int,
 ) -> None:
     n = len(all_results)
@@ -288,11 +348,16 @@ def _results_overview(
     for i, (col, r) in enumerate(zip(cols, all_results[:visible])):
         with col:
             color = _score_color(r.score)
-            label = "C" if isinstance(r, ComboMatch) else "P"
+            if isinstance(r, DPEPositionMatch):
+                label = "D"
+            elif isinstance(r, ComboMatch):
+                label = "C"
+            else:
+                label = "P"
             border = "border:2px solid #1565c0;" if i == current_idx else "border:2px solid transparent;"
             st.markdown(
                 f"<div style='text-align:center;background:{color};color:#fff;"
-                f"border-radius:4px;padding:5px 2px;font-size:0.78rem;{border}'>"
+                f"border-radius:4px;padding:6px 4px;font-size:0.88rem;{border}'>"
                 f"{label}<br><strong>{r.score:.0f}</strong></div>",
                 unsafe_allow_html=True,
             )
@@ -301,7 +366,7 @@ def _results_overview(
 
 
 # ---------------------------------------------------------------------------
-# Recherche
+# Recherche parcelles (chemin existant)
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -335,6 +400,49 @@ def _run_search(
 
 
 # ---------------------------------------------------------------------------
+# Recherche positions DPE (nouveau chemin)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _run_search_positions(
+    commune: str,
+    living_surface: float,
+    dpe: str | None,
+    ges: str | None,
+    dpe_date: str | None,
+    conso_ep: float | None,
+    ges_ep: float | None,
+    postal: str | None,
+    tolerance_pct: float,
+    neighbor_mode: str,
+    db_path_str: str,
+) -> list[DPEPositionMatch]:
+    from cadastre_finder.processing.adjacency import resolve_insee_scope
+    from cadastre_finder.search.dpe_match import search_dpe_positions
+    from cadastre_finder.utils.geocoding import resolve_commune
+
+    db_path = Path(db_path_str)
+
+    res = resolve_commune(commune, postal_code=postal, db_path=db_path)
+    if not res or not res.best:
+        return []
+
+    scope_rang = resolve_insee_scope(res.best.code_insee, NeighborMode(neighbor_mode), db_path)
+
+    return search_dpe_positions(
+        scope_rang=scope_rang,
+        living_surface=living_surface,
+        dpe_label=dpe,
+        ges_label=ges,
+        dpe_date=dpe_date,
+        conso_ep=conso_ep,
+        ges_ep=ges_ep,
+        tolerance_pct=tolerance_pct,
+        db_path=db_path,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Formulaire sidebar
 # ---------------------------------------------------------------------------
 
@@ -343,13 +451,28 @@ def _sidebar() -> dict | None:
     st.sidebar.caption("Recherche de parcelles par commune et surface")
     st.sidebar.write("")
 
+    # --- Mode de recherche ---
+    search_mode = st.sidebar.radio(
+        "Mode de recherche",
+        options=["Positions DPE", "Parcelles"],
+        index=0,
+        horizontal=True,
+        help=(
+            "**Parcelles** : recherche et localise les parcelles cadastrales.\n\n"
+            "**Positions DPE** : affiche directement les adresses depuis la base ADEME "
+            "(surface habitable obligatoire)."
+        ),
+    )
+
+    st.sidebar.write("")
+
     # --- Analyse d'annonce ---
     ad_text = st.sidebar.text_area(
-        "Annonce brute (optionnel)", 
+        "Annonce brute (optionnel)",
         placeholder="Collez l'annonce ici pour extraire les critères...",
         help="Extrait automatiquement les surfaces et labels DPE/GES."
     )
-    
+
     extracted = None
     if ad_text:
         from cadastre_finder.search.ad_parser import parse_ad_text
@@ -369,36 +492,87 @@ def _sidebar() -> dict | None:
     else:
         commune = st.sidebar.text_input("Commune *", placeholder="ex : Neuvy-le-Roi")
 
-    # Champs de recherche avec valeurs par défaut extraites
-    def_surface = extracted.terrain_surface if extracted and extracted.terrain_surface else 5000.0
-    surface = st.sidebar.number_input(
-        "Surface Terrain (m²) *", min_value=100.0, max_value=100_000.0, value=float(def_surface), step=50.0
-    )
-    
-    def_living = extracted.living_surface if extracted and extracted.living_surface else None
-    living_surface = st.sidebar.number_input(
-        "Surface Habitable (m²)", min_value=0.0, max_value=2000.0, value=float(def_living) if def_living else 0.0, step=10.0
-    )
-    living_surface = living_surface if living_surface > 0 else None
+    if search_mode == "Positions DPE":
+        # En mode DPE, seule la surface habitable est le critère principal
+        def_living = extracted.living_surface if extracted and extracted.living_surface else None
+        living_surface = st.sidebar.number_input(
+            "Surface Habitable (m²) *",
+            min_value=10.0, max_value=2000.0,
+            value=float(def_living) if def_living else 100.0,
+            step=5.0,
+        )
+        surface = None
+    else:
+        # Mode parcelles : surface terrain principale, surface habitable optionnelle
+        def_surface = extracted.terrain_surface if extracted and extracted.terrain_surface else 5000.0
+        surface = st.sidebar.number_input(
+            "Surface Terrain (m²) *", min_value=100.0, max_value=100_000.0, value=float(def_surface), step=50.0
+        )
+
+        def_living = extracted.living_surface if extracted and extracted.living_surface else None
+        living_surface_raw = st.sidebar.number_input(
+            "Surface Habitable (m²)", min_value=0.0, max_value=2000.0,
+            value=float(def_living) if def_living else 0.0, step=10.0
+        )
+        living_surface = living_surface_raw if living_surface_raw > 0 else None
 
     c1, c2 = st.sidebar.columns(2)
     def_dpe = extracted.dpe_label if extracted and extracted.dpe_label else None
     dpe = c1.selectbox("DPE", options=[None, "A", "B", "C", "D", "E", "F", "G"], index=[None, "A", "B", "C", "D", "E", "F", "G"].index(def_dpe))
-    
+
     def_ges = extracted.ges_label if extracted and extracted.ges_label else None
     ges = c2.selectbox("GES", options=[None, "A", "B", "C", "D", "E", "F", "G"], index=[None, "A", "B", "C", "D", "E", "F", "G"].index(def_ges))
+
+    if search_mode == "Positions DPE":
+        def_date = extracted.dpe_date if extracted and extracted.dpe_date else ""
+        dpe_date_raw = st.sidebar.text_input(
+            "Date DPE (AAAA-MM-JJ)",
+            value=def_date,
+            placeholder="ex : 2023-06-23  — optionnel mais précis",
+            help="Extraite automatiquement de l'annonce si présente. Discriminant quasi-unique.",
+        )
+        dpe_date = dpe_date_raw.strip() or None
+
+        c3, c4 = st.sidebar.columns(2)
+        conso_ep_raw = c3.number_input(
+            "Conso. (kWh/m²/an)",
+            min_value=0, max_value=600, value=0, step=5,
+            help="Énergie primaire sur le certificat DPE. 0 = non utilisé.",
+        )
+        conso_ep: float | None = float(conso_ep_raw) if conso_ep_raw > 0 else None
+
+        ges_ep_raw = c4.number_input(
+            "CO₂ (kg/m²/an)",
+            min_value=0, max_value=200, value=0, step=1,
+            help="Émissions GES sur le certificat DPE. 0 = non utilisé.",
+        )
+        ges_ep: float | None = float(ges_ep_raw) if ges_ep_raw > 0 else None
+    else:
+        dpe_date = None
+        conso_ep = None
+        ges_ep = None
 
     postal = st.sidebar.text_input("Code postal", placeholder="optionnel")
 
     st.sidebar.divider()
 
-    tolerance_m2 = st.sidebar.number_input(
-        "Tolérance ±m²", min_value=0, max_value=5_000, value=100, step=10
-    )
+    if search_mode == "Positions DPE":
+        # Tolérance en % directement pour éviter la conversion aberrante sur surface habitable
+        tolerance_pct_val = st.sidebar.slider(
+            "Tolérance surface ±%", min_value=1, max_value=30, value=10,
+            help="10 % = ±20 m² pour 200 m² hab. Réduisez si trop de résultats.",
+        )
+        tolerance_pct = float(tolerance_pct_val)
+    else:
+        ref_surface = surface or 5000.0
+        tolerance_m2 = st.sidebar.number_input(
+            "Tolérance ±m²", min_value=0, max_value=5_000, value=100, step=10
+        )
+        tolerance_pct = (tolerance_m2 / ref_surface * 100.0) if ref_surface > 0 else 5.0
 
     neighbor_label = st.sidebar.radio(
         "Voisinage",
-        options=["Aucun", "Voisines rang 1", "Voisines rang 2"],
+        options=["Aucun", "Voisines rang 1", "Voisines rang 2", "Voisines rang 3"],
         index=0,
         horizontal=True,
         help="Étend progressivement la recherche aux communes voisines.",
@@ -407,6 +581,7 @@ def _sidebar() -> dict | None:
         "Aucun": NeighborMode.NONE,
         "Voisines rang 1": NeighborMode.RANK1,
         "Voisines rang 2": NeighborMode.RANK2,
+        "Voisines rang 3": NeighborMode.RANK3,
     }[neighbor_label]
 
     st.sidebar.divider()
@@ -418,16 +593,32 @@ def _sidebar() -> dict | None:
         st.sidebar.error("La commune est obligatoire.")
         return None
 
-    return {
-        "commune": commune,
-        "surface": float(surface),
-        "living_surface": living_surface,
-        "dpe": dpe,
-        "ges": ges,
-        "postal": postal.strip() or None,
-        "tolerance_m2": float(tolerance_m2),
-        "neighbor_mode": neighbor_mode.value,
-    }
+    if search_mode == "Positions DPE":
+        return {
+            "mode": "positions_dpe",
+            "commune": commune,
+            "living_surface": float(living_surface),
+            "dpe": dpe,
+            "ges": ges,
+            "dpe_date": dpe_date,
+            "conso_ep": conso_ep,
+            "ges_ep": ges_ep,
+            "postal": postal.strip() or None,
+            "tolerance_pct": tolerance_pct,
+            "neighbor_mode": neighbor_mode.value,
+        }
+    else:
+        return {
+            "mode": "parcelles",
+            "commune": commune,
+            "surface": float(surface),
+            "living_surface": living_surface,
+            "dpe": dpe,
+            "ges": ges,
+            "postal": postal.strip() or None,
+            "tolerance_pct": tolerance_pct,
+            "neighbor_mode": neighbor_mode.value,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -453,32 +644,56 @@ def main() -> None:
 
     with st.spinner("Recherche en cours…"):
         try:
-            all_results = _run_search(
-                commune=p["commune"],
-                surface=p["surface"],
-                living_surface=p.get("living_surface"),
-                dpe=p.get("dpe"),
-                ges=p.get("ges"),
-                postal=p["postal"],
-                tolerance_m2=p["tolerance_m2"],
-                neighbor_mode=p["neighbor_mode"],
-                db_path_str=str(DB_PATH),
-            )
+            if p.get("mode") == "positions_dpe":
+                all_results = _run_search_positions(
+                    commune=p["commune"],
+                    living_surface=p["living_surface"],
+                    dpe=p.get("dpe"),
+                    ges=p.get("ges"),
+                    dpe_date=p.get("dpe_date"),
+                    conso_ep=p.get("conso_ep"),
+                    ges_ep=p.get("ges_ep"),
+                    postal=p["postal"],
+                    tolerance_pct=p["tolerance_pct"],
+                    neighbor_mode=p["neighbor_mode"],
+                    db_path_str=str(DB_PATH),
+                )
+            else:
+                all_results = _run_search(
+                    commune=p["commune"],
+                    surface=p["surface"],
+                    living_surface=p.get("living_surface"),
+                    dpe=p.get("dpe"),
+                    ges=p.get("ges"),
+                    postal=p["postal"],
+                    tolerance_m2=p.get("tolerance_pct", 5.0) / 100.0 * p["surface"],
+                    neighbor_mode=p["neighbor_mode"],
+                    db_path_str=str(DB_PATH),
+                )
         except Exception as exc:
             st.error(f"Erreur lors de la recherche : {exc}")
             return
 
     if not all_results:
-        st.warning(
-            "Aucun résultat. Augmentez la tolérance ou élargissez le voisinage (rang 1 ou 2)."
-        )
+        if p.get("mode") == "positions_dpe":
+            st.warning(
+                "Aucune position DPE trouvée. Vérifiez la surface habitable, le DPE/GES, "
+                "la date DPE, ou élargissez la tolérance et le voisinage."
+            )
+        else:
+            st.warning(
+                "Aucun résultat. Augmentez la tolérance ou élargissez le voisinage (rang 1 ou 2)."
+            )
         return
 
     idx = st.session_state.get("result_idx", 0)
     idx = max(0, min(idx, len(all_results) - 1))
     st.session_state.result_idx = idx
 
-    st.subheader(f"{p['commune']} · {p['surface']:,.0f} m²")
+    if p.get("mode") == "positions_dpe":
+        st.subheader(f"{p['commune']} · {p['living_surface']:,.0f} m² hab. — Positions DPE")
+    else:
+        st.subheader(f"{p['commune']} · {p['surface']:,.0f} m²")
     st.caption(f"{len(all_results)} résultat(s) — triés par score")
     _results_overview(all_results, idx)
     st.divider()
