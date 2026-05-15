@@ -1,7 +1,20 @@
 """Configuration centrale du projet cadastre-finder."""
+import os
+import sys
 from pathlib import Path
 
-ROOT_DIR = Path(__file__).parent.parent.parent
+
+def _resolve_root() -> Path:
+    # Mode portable (PyInstaller) : l'exe est dans backend/, data/ est au niveau parent
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent.parent
+    # Variable d'environnement explicite (tests / CI)
+    if env_data := os.environ.get("CADASTRE_DATA_DIR"):
+        return Path(env_data).parent
+    return Path(__file__).parent.parent.parent
+
+
+ROOT_DIR = _resolve_root()
 
 # Répertoires
 DATA_RAW = ROOT_DIR / "data" / "raw"

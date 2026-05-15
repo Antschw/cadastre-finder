@@ -451,7 +451,7 @@ def search_combos(
                 + (f" + {n_extra} voisins non-ancres de plus bas indice" if n_extra else "")
             )
 
-        combos = _find_combos_dfs(candidates, graph, surface_m2, tolerance_pct, max_parts, top_n * 3, start_indices=start_indices)
+        combos = _find_combos_dfs(candidates, graph, surface_m2, tolerance_pct, max_parts, top_n * 8, start_indices=start_indices)
         combos = _deduplicate_combos(combos, surface_m2)
 
         if built_only:

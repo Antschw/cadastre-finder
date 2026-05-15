@@ -1,4 +1,4 @@
-export type NeighborMode = 'none' | 'rank1' | 'rank2' | 'rank3';
+export type NeighborMode = 'none' | 'rank1' | 'rank2' | 'rank3' | 'dept';
 export type DpeLabel = 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G';
 
 export interface ComboPartDto {
@@ -97,6 +97,7 @@ export interface ParseAdResponse {
   ges_label: DpeLabel | null;
   dpe_date: string | null;
   commune: string | null;
+  postal_code: string | null;
 }
 
 export interface CommuneItem {

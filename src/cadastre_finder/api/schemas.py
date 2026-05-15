@@ -86,7 +86,7 @@ SearchResult = Annotated[
 # ---------------------------------------------------------------------------
 
 class SearchParcelRequest(BaseModel):
-    commune: str
+    commune: Optional[str] = ""
     surface_m2: float
     living_surface: Optional[float] = None
     dpe_label: Optional[str] = None
@@ -97,7 +97,7 @@ class SearchParcelRequest(BaseModel):
 
 
 class SearchDPERequest(BaseModel):
-    commune: str
+    commune: Optional[str] = ""
     living_surface: float
     dpe_label: Optional[str] = None
     ges_label: Optional[str] = None
@@ -120,6 +120,7 @@ class ParseAdResponse(BaseModel):
     ges_label: Optional[str] = None
     dpe_date: Optional[str] = None
     commune: Optional[str] = None
+    postal_code: Optional[str] = None
 
 
 class CommuneItem(BaseModel):

@@ -252,6 +252,21 @@ def resolve_insee_scope(
     if mode is NeighborMode.NONE:
         return scope
 
+    if mode is NeighborMode.DEPT:
+        dept_code = code_insee[:2]
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            rows = con.execute(
+                "SELECT code_insee FROM communes WHERE LEFT(code_insee, 2) = ?",
+                [dept_code],
+            ).fetchall()
+        finally:
+            con.close()
+        for (code,) in rows:
+            if code not in scope:
+                scope[code] = 4  # rang fictif « département »
+        return scope
+
     max_rang = {NeighborMode.RANK1: 1, NeighborMode.RANK2: 2, NeighborMode.RANK3: 3}.get(mode, 2)
     con = duckdb.connect(str(db_path), read_only=True)
     try:

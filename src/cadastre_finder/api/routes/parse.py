@@ -19,4 +19,5 @@ async def parse_ad(req: ParseAdRequest) -> ParseAdResponse:
         ges_label=criteria.ges_label,
         dpe_date=criteria.dpe_date,
         commune=criteria.commune,
+        postal_code=criteria.postal_code,
     )

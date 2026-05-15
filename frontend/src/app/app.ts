@@ -1,4 +1,4 @@
-import { Component, signal } from '@angular/core';
+import { AfterViewInit, Component, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { MatSidenavModule } from '@angular/material/sidenav';
 import { MatIconModule } from '@angular/material/icon';
@@ -83,10 +83,28 @@ import { SearchResultDto } from './core/models/search.models';
     .results-wrapper { width: 100%; }
   `],
 })
-export class App {
+export class App implements AfterViewInit {
   results = signal<SearchResultDto[]>([]);
   currentIndex = signal(0);
   hasSearched = signal(false);
+
+  ngAfterViewInit(): void {
+    // En mode Tauri (FastAPI sur 127.0.0.1), les <a target="_blank"> sont bloqués
+    // par WebView2. On délègue l'ouverture au serveur Python via fetch.
+    if (window.location.hostname !== '127.0.0.1') return;
+
+    document.addEventListener('click', (e: MouseEvent) => {
+      const anchor = (e.target as HTMLElement).closest('a') as HTMLAnchorElement | null;
+      if (
+        anchor?.target === '_blank' &&
+        anchor.href &&
+        (anchor.href.startsWith('https://') || anchor.href.startsWith('http://'))
+      ) {
+        e.preventDefault();
+        fetch(`/api/open-url?url=${encodeURIComponent(anchor.href)}`).catch(() => {});
+      }
+    }, true);
+  }
 
   onResults(data: SearchResultDto[]): void {
     this.results.set(data);

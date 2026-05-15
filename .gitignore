@@ -30,5 +30,9 @@ out/
 # Notebooks checkpoints
 .ipynb_checkpoints/
 
+# Packaging / Rust
+packaging/tauri-app/target/
+packaging/tauri-app/node_modules/
+
 # OS
 .DS_Store

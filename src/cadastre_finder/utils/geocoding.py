@@ -235,23 +235,35 @@ def resolve_commune(
 
     1. Recherche locale dans la table communes DuckDB
     2. Sinon, fallback sur la Géoplateforme
-    3. Retourne un ResolveResult avec la liste des candidats triés par score
+    3. Si name est vide et postal_code fourni, résolution par code postal via Géoplateforme
+    4. Retourne un ResolveResult avec la liste des candidats triés par score
 
     Exemples :
         >>> r = resolve_commune("Mortagne-au-Perche")
         >>> r.unique.code_insee
         '61293'
     """
-    local = _search_local(name, postal_code, db_path)
+    clean_name = (name or "").strip()
+
+    if not clean_name:
+        if not postal_code:
+            return ResolveResult()
+        logger.info(f"[geocoding] Résolution par code postal uniquement : {postal_code}")
+        api_results = _search_api(postal_code, postal_code)
+        if not api_results:
+            logger.warning(f"[geocoding] Aucune commune trouvée pour le code postal '{postal_code}'")
+        return ResolveResult(candidates=api_results)
+
+    local = _search_local(clean_name, postal_code, db_path)
     if local:
-        logger.debug(f"[geocoding] '{name}' → {len(local)} résultat(s) local/locaux")
+        logger.debug(f"[geocoding] '{clean_name}' → {len(local)} résultat(s) local/locaux")
         return ResolveResult(candidates=local)
 
-    logger.info(f"[geocoding] '{name}' non trouvé localement, interrogation Géoplateforme...")
-    api_results = _search_api(name, postal_code)
+    logger.info(f"[geocoding] '{clean_name}' non trouvé localement, interrogation Géoplateforme...")
+    api_results = _search_api(clean_name, postal_code)
 
     if not api_results:
-        logger.warning(f"[geocoding] Aucun résultat pour '{name}'")
+        logger.warning(f"[geocoding] Aucun résultat pour '{clean_name}'")
         return ResolveResult()
 
     return ResolveResult(candidates=api_results)

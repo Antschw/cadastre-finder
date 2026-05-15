@@ -1,0 +1,11 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/schema/desktop-capability.json",
+  "identifier": "default",
+  "description": "Capability par défaut pour Cadastre Finder",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "window-state:default"
+  ]
+}

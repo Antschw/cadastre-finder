@@ -271,12 +271,16 @@ def _score_one(
         pp = _polsby_popper_geojson(result.geometry_geojson)
     s_compact = pp * SCORE_W_COMPACT
 
-    # Bonus DPE
+    # Bonus DPE : fort uniquement si l'utilisateur a renseigné un DPE correspondant.
+    # Un enrichissement incidentel (enrich_combos_dpe sans requête DPE) ne doit pas
+    # faire remonter artificiellement des résultats non pertinents.
     bonus = 0.0
     if result.dpe_label:
-        bonus += SCORE_BONUS_DPE_PARCEL
-        if query_dpe_label and result.dpe_label == query_dpe_label:
-            bonus += SCORE_BONUS_DPE_LABEL
+        if query_dpe_label:
+            if result.dpe_label == query_dpe_label:
+                bonus += SCORE_BONUS_DPE_PARCEL + SCORE_BONUS_DPE_LABEL
+        else:
+            bonus += 5.0  # Enrichissement incidentel : léger signal de confiance
 
     return s_distance + s_surface + s_occupation + s_compact + bonus
 

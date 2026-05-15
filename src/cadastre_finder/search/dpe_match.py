@@ -378,13 +378,17 @@ def _find_micro_combos_in_pool(
 
     Pré-parse les géométries une seule fois, filtre par surface puis par
     contiguïté spatiale (Shapely) avant de construire le ComboMatch.
-    S'arrête au plus petit k donnant des résultats.
+    Parcourt tous les k sans s'arrêter au premier k fructueux : une combinaison
+    de plus petites parcelles (k=3+) peut être plus précise qu'une paire à k=2.
+    Priorité aux combos contenant la parcelle la plus proche du point géocodé (pool[0]).
     """
     from itertools import combinations as _combinations
 
     delta = target_terrain * tolerance_pct / 100.0
     lo, hi = target_terrain - delta, target_terrain + delta
     found: list[ComboMatch] = []
+    # ID de la parcelle la plus proche du point DPE géocodé (pool trié par dist_m)
+    nearest_id = pool[0][0] if pool else None
 
     # Pré-parser les géométries Shapely une seule fois (r[5] = GeoJSON)
     parsed_geoms: list[Optional[object]] = []
@@ -407,9 +411,17 @@ def _find_micro_combos_in_pool(
             parts = [full[pid] for pid in ids if pid in full]
             if parts:
                 found.append(_build_combo_from_parts(parts, dpe_record))
-        if found:
-            break
-    return found
+
+    if not found:
+        return []
+
+    # Priorité aux combos contenant la parcelle la plus proche du point DPE géocodé,
+    # puis par précision de surface (delta absolu)
+    found.sort(key=lambda c: (
+        0 if nearest_id and any(p.id_parcelle == nearest_id for p in c.parts) else 1,
+        abs(c.total_contenance - target_terrain),
+    ))
+    return found[:5]
 
 
 def _fetch_neighbor_ids(con: duckdb.DuckDBPyConnection, parcel_id: str) -> list[str]:

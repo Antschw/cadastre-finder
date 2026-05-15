@@ -70,8 +70,8 @@ def _run_dpe_search(req: SearchDPERequest) -> list:
 
 @router.post("/search/parcelles")
 async def search_parcelles(req: SearchParcelRequest) -> list[SearchResult]:
-    if not req.commune:
-        raise HTTPException(status_code=422, detail="La commune est requise.")
+    if not req.commune and not req.postal_code:
+        raise HTTPException(status_code=422, detail="La commune ou le code postal est requis.")
     if req.surface_m2 <= 0:
         raise HTTPException(status_code=422, detail="La surface doit être positive.")
 
@@ -81,8 +81,8 @@ async def search_parcelles(req: SearchParcelRequest) -> list[SearchResult]:
 
 @router.post("/search/dpe-positions")
 async def search_dpe_positions_route(req: SearchDPERequest) -> list[DPEPositionMatchSchema]:
-    if not req.commune:
-        raise HTTPException(status_code=422, detail="La commune est requise.")
+    if not req.commune and not req.postal_code:
+        raise HTTPException(status_code=422, detail="La commune ou le code postal est requis.")
     if req.living_surface <= 0:
         raise HTTPException(status_code=422, detail="La surface habitable doit être positive.")
 

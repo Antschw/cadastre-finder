@@ -12,6 +12,7 @@ class NeighborMode(str, Enum):
     RANK1 = "rank1"    # principale + voisines directes
     RANK2 = "rank2"    # principale + rang 1 + rang 2
     RANK3 = "rank3"    # principale + rang 1 + rang 2 + rang 3
+    DEPT = "dept"      # toutes les communes du même département (mode DPE uniquement)
 
 
 @dataclass

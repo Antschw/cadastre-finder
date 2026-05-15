@@ -144,22 +144,27 @@ export type SearchMode = 'parcelles' | 'dpe';
           </mat-form-field>
         </div>
 
-        <!-- Champs spécifiques mode DPE -->
+        <!-- Champs spécifiques mode DPE (repliables) -->
         @if (mode === 'dpe') {
-          <mat-form-field appearance="outline" class="full-width">
-            <mat-label>Date DPE (AAAA-MM-JJ)</mat-label>
-            <input matInput formControlName="dpeDate" placeholder="2023-06-15" />
-          </mat-form-field>
-          <div class="two-cols form-field-gap">
-            <mat-form-field appearance="outline">
-              <mat-label>Conso (kWh/m²/an)</mat-label>
-              <input matInput type="number" formControlName="consoEp" min="0" max="600" step="5" />
+          <mat-expansion-panel class="dpe-advanced-panel form-field-gap">
+            <mat-expansion-panel-header>
+              <mat-panel-title>Critères avancés (optionnels)</mat-panel-title>
+            </mat-expansion-panel-header>
+            <mat-form-field appearance="outline" class="full-width">
+              <mat-label>Date DPE (AAAA-MM-JJ)</mat-label>
+              <input matInput formControlName="dpeDate" placeholder="2023-06-15" />
             </mat-form-field>
-            <mat-form-field appearance="outline">
-              <mat-label>GES émis (kg CO₂)</mat-label>
-              <input matInput type="number" formControlName="gesEp" min="0" max="200" step="1" />
-            </mat-form-field>
-          </div>
+            <div class="two-cols form-field-gap">
+              <mat-form-field appearance="outline">
+                <mat-label>Conso (kWh/m²/an)</mat-label>
+                <input matInput type="number" formControlName="consoEp" min="0" max="600" step="5" />
+              </mat-form-field>
+              <mat-form-field appearance="outline">
+                <mat-label>GES émis (kg CO₂)</mat-label>
+                <input matInput type="number" formControlName="gesEp" min="0" max="200" step="1" />
+              </mat-form-field>
+            </div>
+          </mat-expansion-panel>
         }
 
         <!-- Tolérance -->
@@ -180,6 +185,9 @@ export type SearchMode = 'parcelles' | 'dpe';
             <mat-button-toggle value="rank1">Rang 1</mat-button-toggle>
             <mat-button-toggle value="rank2">Rang 2</mat-button-toggle>
             <mat-button-toggle value="rank3">Rang 3</mat-button-toggle>
+            @if (mode === 'dpe') {
+              <mat-button-toggle value="dept">Dépt.</mat-button-toggle>
+            }
           </mat-button-toggle-group>
         </div>
 
@@ -233,6 +241,7 @@ export type SearchMode = 'parcelles' | 'dpe';
       gap: 10px;
     }
     .ad-panel { margin-bottom: 12px; box-shadow: none !important; border: 1px solid #e0e0e0; }
+    .dpe-advanced-panel { box-shadow: none !important; border: 1px solid #e0e0e0; }
     .slider-label { font-size: 0.82rem; color: #555; display: block; margin-bottom: 4px; }
     .full-slider { width: 100%; }
     .neighbor-toggle { width: 100%; }
@@ -327,11 +336,14 @@ export class SearchFormComponent implements OnInit {
 
   get canSearch(): boolean {
     const c = this.form.get('commune')?.value;
-    const hasCommune = c && (typeof c === 'object' || (typeof c === 'string' && c.trim().length > 0));
+    const cp = this.form.get('postalCode')?.value;
+    const hasLocation =
+      (c && (typeof c === 'object' || (typeof c === 'string' && c.trim().length > 0))) ||
+      (typeof cp === 'string' && /^\d{5}$/.test(cp));
     if (this.mode === 'parcelles') {
-      return hasCommune && (this.form.get('surfaceTerrain')?.value > 0);
+      return !!(hasLocation && (this.form.get('surfaceTerrain')?.value > 0));
     }
-    return hasCommune && (this.form.get('surfaceHabitable')?.value > 0);
+    return !!(hasLocation && (this.form.get('surfaceHabitable')?.value > 0));
   }
 
   parseAd(): void {
@@ -344,7 +356,19 @@ export class SearchFormComponent implements OnInit {
       if (criteria.dpe_label) patch['dpeLabel'] = criteria.dpe_label;
       if (criteria.ges_label) patch['gesLabel'] = criteria.ges_label;
       if (criteria.dpe_date) patch['dpeDate'] = criteria.dpe_date;
-      if (criteria.commune) patch['commune'] = criteria.commune;
+      if (criteria.postal_code) patch['postalCode'] = criteria.postal_code;
+
+      if (criteria.commune) {
+        const normalized = criteria.commune.toLowerCase().trim();
+        // Cherche d'abord une correspondance exacte, puis partielle
+        const found =
+          this.allCommunes.find(c => c.nom.toLowerCase() === normalized) ??
+          this.allCommunes.find(c =>
+            c.nom.toLowerCase().startsWith(normalized) || normalized.startsWith(c.nom.toLowerCase())
+          );
+        patch['commune'] = found ?? criteria.commune;
+      }
+
       this.form.patchValue(patch);
     });
   }
